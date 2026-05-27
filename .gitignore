@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+htmlcov/
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venv/
+venv/
+env/
+
+# uv
+.python-version
+
+# Local runtime outputs
+.codex_oauth/
+.langgraph_api/
+.langgraph/
+runs/
+workspace/
+
+# Local reference material and cloned UI
+references/
+agent-chat-ui/
