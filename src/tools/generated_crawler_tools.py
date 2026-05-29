@@ -22,6 +22,10 @@ CRAWLER_ROOT = CONFIG.workspace.crawlers_dir
 CONTAINER_WORKSPACE = CONFIG.docker.container_workspace_dir
 MAX_PREVIEW_CHARS = 1600
 CRAWLER_SCHEMA_VERSION = "job_extraction_context_v1"
+CRAWLER_CODE_FILE_NAME = "crawler.py"
+CRAWLER_RESULT_FILE_NAME = "job_result.json"
+CRAWLER_LOG_FILE_NAME = "crawler.log"
+CRAWLER_RUNTIME_GUARD_FILE_NAME = "sitecustomize.py"
 CRAWLER_SETUP_TIMEOUT_SECONDS = 120
 CRAWLER_DEPENDENCY_PACKAGES = {
     "requests": "requests==2.34.2",
@@ -116,6 +120,9 @@ REQUIRED_CRAWLER_CONTEXT_KEYS = {
 }
 
 
+# Public tool entry points
+
+
 @tool
 def analyze_job_html_structure(url: str = "", html: str = "", html_file: str = "") -> dict[str, Any]:
     """Analyze cached HTML and return compact DOM hints for generating a job crawler."""
@@ -128,30 +135,8 @@ def analyze_job_html_structure(url: str = "", html: str = "", html_file: str = "
     tags = [tag.name for tag in soup.find_all()]
     tag_counter = Counter(tags)
 
-    containers: list[dict[str, str]] = []
-    for tag_name in ("main", "article", "section", "div", "li"):
-        for element in soup.find_all(tag_name, class_=True)[:8]:
-            classes = " ".join(element.get("class", []))
-            preview = _collapse_text(element.get_text(" "))[:120]
-            if classes and preview:
-                containers.append({"tag": tag_name, "class": classes, "text_preview": preview})
-
-    links: list[dict[str, str]] = []
-    for link in soup.find_all("a", href=True)[:30]:
-        href = urljoin(url, str(link["href"]).strip()) if url else str(link["href"]).strip()
-        label = _collapse_text(link.get_text(" "))[:80]
-        if href:
-            links.append({"href": href, "text": label})
-
-    json_ld_types = []
-    for script in soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)}):
-        raw = script.string or script.get_text()
-        for item in _json_ld_items(raw or ""):
-            item_type = item.get("@type") if isinstance(item, dict) else None
-            if item_type:
-                json_ld_types.append(item_type)
-
     anti_scraping = _detect_anti_scraping(content, text)
+    json_ld_types = _json_ld_types(soup)
     likely_job_sections = _likely_job_sections(soup)
 
     return {
@@ -163,8 +148,8 @@ def analyze_job_html_structure(url: str = "", html: str = "", html_file: str = "
         "total_tags": len(tags),
         "tag_distribution": dict(tag_counter.most_common(12)),
         "json_ld_types": json_ld_types[:12],
-        "common_containers": containers[:16],
-        "sample_links": links[:20],
+        "common_containers": _common_containers(soup)[:16],
+        "sample_links": _sample_links(soup, url)[:20],
         "likely_job_sections": likely_job_sections[:12],
         "anti_scraping": anti_scraping,
         "recommended_strategy": _recommended_strategy(anti_scraping, json_ld_types, text),
@@ -177,10 +162,10 @@ def save_job_crawler_code(code: str, run_id: str = "ad_hoc", job_id: str = "job"
     clean_code = _strip_code_fence(code)
     rel_dir = _crawler_dir(run_id=run_id, job_id=job_id)
     rel_dir.mkdir(parents=True, exist_ok=True)
-    code_path = rel_dir / "crawler.py"
+    code_path = rel_dir / CRAWLER_CODE_FILE_NAME
     code_path.write_text(clean_code, encoding="utf-8")
-    output_path = rel_dir / "job_result.json"
-    log_path = rel_dir / "crawler.log"
+    output_path = rel_dir / CRAWLER_RESULT_FILE_NAME
+    log_path = rel_dir / CRAWLER_LOG_FILE_NAME
     return {
         "success": True,
         "code_file": str(code_path),
@@ -196,26 +181,20 @@ def save_job_crawler_code(code: str, run_id: str = "ad_hoc", job_id: str = "job"
 @tool
 def validate_job_crawler_code(code_file: str) -> dict[str, Any]:
     """Validate generated crawler Python syntax and the required output contract."""
-    path = _resolve_workspace_file(code_file)
-    if path is None or not path.exists():
-        return {"success": False, "error": "Crawler code file not found.", "code_file": code_file}
+    path, error = _existing_crawler_code_file_or_error(code_file)
+    if error is not None:
+        return error
+    assert path is not None
 
     parse_error, contract_errors = _crawler_validation_errors(path)
-    if parse_error is not None:
-        return {
-            "success": False,
-            "code_file": str(path),
-            "error": parse_error,
-        }
-
-    if contract_errors:
-        return {
-            "success": False,
-            "code_file": str(path),
-            "container_code_file": _container_path(path),
-            "error": "Crawler contract validation failed.",
-            "contract_errors": contract_errors,
-        }
+    validation_error = _crawler_validation_error_response(
+        path,
+        parse_error,
+        contract_errors,
+        include_container_for_parse_error=False,
+    )
+    if validation_error is not None:
+        return validation_error
 
     return {
         "success": True,
@@ -232,51 +211,31 @@ def build_job_crawler_run_command(code_file: str, url: str, timeout: int = 60) -
     if url_error:
         return {"success": False, "error": f"Unsafe crawler URL: {url_error}", "url": url}
 
-    path = _resolve_workspace_file(code_file)
-    if path is None or not path.exists():
-        return {"success": False, "error": "Crawler code file not found.", "code_file": code_file}
+    path, error = _existing_crawler_code_file_or_error(code_file)
+    if error is not None:
+        return error
+    assert path is not None
 
     parse_error, contract_errors = _crawler_validation_errors(path)
-    if parse_error is not None:
-        return {
-            "success": False,
-            "code_file": str(path),
-            "container_code_file": _container_path(path),
-            "error": parse_error,
-        }
-    if contract_errors:
-        return {
-            "success": False,
-            "code_file": str(path),
-            "container_code_file": _container_path(path),
-            "error": "Crawler contract validation failed.",
-            "contract_errors": contract_errors,
-        }
+    validation_error = _crawler_validation_error_response(
+        path,
+        parse_error,
+        contract_errors,
+        include_container_for_parse_error=True,
+    )
+    if validation_error is not None:
+        return validation_error
 
     run_dir = path.parent
-    output_path = run_dir / "job_result.json"
-    log_path = run_dir / "crawler.log"
-    guard_path = run_dir / "sitecustomize.py"
+    output_path = run_dir / CRAWLER_RESULT_FILE_NAME
+    log_path = run_dir / CRAWLER_LOG_FILE_NAME
+    guard_path = run_dir / CRAWLER_RUNTIME_GUARD_FILE_NAME
     guard_path.write_text(_crawler_runtime_guard_source(), encoding="utf-8")
     container_code_file = _container_path(path)
     container_output_file = _container_path(output_path)
     container_log_file = _container_path(log_path)
     container_run_dir = _container_path(run_dir)
     container_guard_file = _container_path(guard_path)
-    setup_command = _crawler_dependency_setup_command()
-    run_command = " ".join(
-        [
-            "set -o pipefail;",
-            f"rm -f {shlex.quote(container_output_file)} {shlex.quote(container_log_file)} &&",
-            f"timeout {int(timeout)}s",
-            "env",
-            f"TARGET_URL={shlex.quote(url)}",
-            f"OUTPUT_FILE={shlex.quote(container_output_file)}",
-            f"PYTHONPATH={shlex.quote(container_run_dir)}",
-            f"python {shlex.quote(container_code_file)}",
-            f"2>&1 | tee {shlex.quote(container_log_file)}",
-        ]
-    )
     return {
         "success": True,
         "code_file": str(path),
@@ -288,10 +247,20 @@ def build_job_crawler_run_command(code_file: str, url: str, timeout: int = 60) -
         "runtime_guard_file": str(guard_path),
         "container_runtime_guard_file": container_guard_file,
         "validated_code_sha256": _file_sha256(path),
-        "setup_command": setup_command,
-        "run_command": run_command,
+        "setup_command": _crawler_dependency_setup_command(),
+        "run_command": _crawler_run_command(
+            url=url,
+            timeout=timeout,
+            container_code_file=container_code_file,
+            container_output_file=container_output_file,
+            container_log_file=container_log_file,
+            container_run_dir=container_run_dir,
+        ),
         "read_result_instruction": f"After execute succeeds, read {container_output_file}.",
     }
+
+
+# Workspace path and command helpers
 
 
 def _crawler_dir(run_id: str, job_id: str) -> Path:
@@ -325,6 +294,13 @@ def _resolve_workspace_file(file_path: str) -> Path | None:
     return resolved
 
 
+def _existing_crawler_code_file_or_error(code_file: str) -> tuple[Path | None, dict[str, Any] | None]:
+    path = _resolve_workspace_file(code_file)
+    if path is None or not path.exists():
+        return None, {"success": False, "error": "Crawler code file not found.", "code_file": code_file}
+    return path, None
+
+
 def _container_path(path: Path) -> str:
     rel = path.resolve().relative_to(WORKSPACE_DIR)
     return f"{CONTAINER_WORKSPACE}/{rel.as_posix()}"
@@ -338,6 +314,33 @@ def _load_html(*, html: str, html_file: str) -> str:
         if path is not None and path.exists() and path.is_file():
             return path.read_text(encoding="utf-8", errors="ignore")
     return ""
+
+
+def _crawler_run_command(
+    *,
+    url: str,
+    timeout: int,
+    container_code_file: str,
+    container_output_file: str,
+    container_log_file: str,
+    container_run_dir: str,
+) -> str:
+    return " ".join(
+        [
+            "set -o pipefail;",
+            f"rm -f {shlex.quote(container_output_file)} {shlex.quote(container_log_file)} &&",
+            f"timeout {int(timeout)}s",
+            "env",
+            f"TARGET_URL={shlex.quote(url)}",
+            f"OUTPUT_FILE={shlex.quote(container_output_file)}",
+            f"PYTHONPATH={shlex.quote(container_run_dir)}",
+            f"python {shlex.quote(container_code_file)}",
+            f"2>&1 | tee {shlex.quote(container_log_file)}",
+        ]
+    )
+
+
+# Crawler dependency setup and validation entry helpers
 
 
 def _crawler_dependency_setup_command() -> str:
@@ -372,8 +375,40 @@ def _crawler_validation_errors(path: Path) -> tuple[str | None, list[str]]:
     return None, _crawler_contract_errors(source, tree)
 
 
+def _crawler_validation_error_response(
+    path: Path,
+    parse_error: str | None,
+    contract_errors: list[str],
+    *,
+    include_container_for_parse_error: bool,
+) -> dict[str, Any] | None:
+    if parse_error is not None:
+        response: dict[str, Any] = {
+            "success": False,
+            "code_file": str(path),
+            "error": parse_error,
+        }
+        if include_container_for_parse_error:
+            response["container_code_file"] = _container_path(path)
+        return response
+
+    if contract_errors:
+        return {
+            "success": False,
+            "code_file": str(path),
+            "container_code_file": _container_path(path),
+            "error": "Crawler contract validation failed.",
+            "contract_errors": contract_errors,
+        }
+
+    return None
+
+
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+# Runtime guard source written next to generated crawlers
 
 
 def _crawler_runtime_guard_source() -> str:
@@ -504,6 +539,9 @@ for _name in ("copy", "copy2", "copyfile", "copytree", "move", "rmtree"):
     if hasattr(shutil, _name):
         setattr(shutil, _name, _blocked_process)
 '''
+
+
+# Crawler contract validation
 
 
 def _crawler_contract_errors(source: str, tree: ast.AST) -> list[str]:
@@ -720,22 +758,21 @@ def _request_url_arg(node: ast.Call, session_aliases: set[str]) -> ast.AST | Non
     if not isinstance(func, ast.Attribute) or func.attr not in HTTP_REQUEST_METHODS:
         return None
 
-    if isinstance(func.value, ast.Name) and func.value.id == "requests":
-        if func.attr == "request":
-            return node.args[1] if len(node.args) >= 2 else _keyword_value(node, "url")
-        return node.args[0] if node.args else _keyword_value(node, "url")
+    if not _is_http_request_receiver(func.value, session_aliases):
+        return None
+    return _request_call_url_argument(node, func.attr)
 
-    if isinstance(func.value, ast.Name) and func.value.id in session_aliases:
-        if func.attr == "request":
-            return node.args[1] if len(node.args) >= 2 else _keyword_value(node, "url")
-        return node.args[0] if node.args else _keyword_value(node, "url")
 
-    if isinstance(func.value, ast.Call) and _is_requests_session_call(func.value):
-        if func.attr == "request":
-            return node.args[1] if len(node.args) >= 2 else _keyword_value(node, "url")
-        return node.args[0] if node.args else _keyword_value(node, "url")
+def _is_http_request_receiver(node: ast.AST, session_aliases: set[str]) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == "requests" or node.id in session_aliases
+    return isinstance(node, ast.Call) and _is_requests_session_call(node)
 
-    return None
+
+def _request_call_url_argument(node: ast.Call, method_name: str) -> ast.AST | None:
+    if method_name == "request":
+        return node.args[1] if len(node.args) >= 2 else _keyword_value(node, "url")
+    return node.args[0] if node.args else _keyword_value(node, "url")
 
 
 def _requests_session_aliases(tree: ast.AST) -> set[str]:
@@ -1220,6 +1257,43 @@ def _open_call_mode(node: ast.Call) -> str | None:
         if keyword.arg == "mode":
             return _literal_string(keyword.value)
     return None
+
+
+# HTML analysis helpers
+
+
+def _common_containers(soup: BeautifulSoup) -> list[dict[str, str]]:
+    containers: list[dict[str, str]] = []
+    for tag_name in ("main", "article", "section", "div", "li"):
+        for element in soup.find_all(tag_name, class_=True)[:8]:
+            classes = " ".join(element.get("class", []))
+            preview = _collapse_text(element.get_text(" "))[:120]
+            if classes and preview:
+                containers.append({"tag": tag_name, "class": classes, "text_preview": preview})
+    return containers
+
+
+def _sample_links(soup: BeautifulSoup, url: str) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    for link in soup.find_all("a", href=True)[:30]:
+        href = str(link["href"]).strip()
+        if url:
+            href = urljoin(url, href)
+        label = _collapse_text(link.get_text(" "))[:80]
+        if href:
+            links.append({"href": href, "text": label})
+    return links
+
+
+def _json_ld_types(soup: BeautifulSoup) -> list[Any]:
+    types: list[Any] = []
+    for script in soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)}):
+        raw = script.string or script.get_text()
+        for item in _json_ld_items(raw or ""):
+            item_type = item.get("@type") if isinstance(item, dict) else None
+            if item_type:
+                types.append(item_type)
+    return types
 
 
 def _visible_text(soup: BeautifulSoup) -> str:

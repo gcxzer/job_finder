@@ -17,6 +17,7 @@ WORKSPACE_DIR = CONFIG.workspace.root_dir
 LATEST_DIR = CONFIG.workspace.latest_dir
 RUNS_DIR = CONFIG.workspace.runs_dir
 
+STATE_FILE_NAME = "job_search_state.json"
 ARTIFACT_FILES = {
     "01_intake_brief.md",
     "02_raw_job_results.md",
@@ -26,6 +27,7 @@ ARTIFACT_FILES = {
     "06_final_job_search_report.md",
 }
 FINAL_REPORT_FILE_NAME = "06_final_job_search_report.md"
+FINAL_REPORT_URL_MATCH_THRESHOLD = 0.65
 FINAL_REPORT_URL_SOURCE_SECTIONS = (
     ("03_verified_job_results.md", "Verified Job State JSON"),
     ("02_raw_job_results.md", "Job State JSON"),
@@ -109,6 +111,9 @@ TRACKING_QUERY_PARAMS = {
 TRACKING_QUERY_PREFIXES = ("utm_",)
 
 
+# Public tool entry points
+
+
 @tool
 def start_workspace_run() -> dict[str, Any]:
     """Create workspace/latest and a run directory."""
@@ -151,11 +156,7 @@ def save_workspace_file(file_path: str, content: str) -> dict[str, Any]:
 def save_job_artifact(run_id: str, file_name: str, content: str) -> dict[str, Any]:
     """Save a job-search artifact to latest/ and the matching runs/<run_id>/ snapshot."""
     if file_name not in ARTIFACT_FILES:
-        return {
-            "success": False,
-            "file_name": file_name,
-            "error": f"Unsupported artifact file. Expected one of: {sorted(ARTIFACT_FILES)}",
-        }
+        return _unsupported_artifact_error(file_name)
 
     run_dir, error = _existing_run_dir_or_error(run_id)
     if error is not None:
@@ -205,11 +206,7 @@ def update_job_search_state_from_artifact(
 ) -> dict[str, Any]:
     """Extract a state JSON block from a saved artifact and merge it into the job dedupe index."""
     if file_name not in ARTIFACT_FILES:
-        return {
-            "success": False,
-            "file_name": file_name,
-            "error": f"Unsupported artifact file. Expected one of: {sorted(ARTIFACT_FILES)}",
-        }
+        return _unsupported_artifact_error(file_name)
 
     run_dir, error = _existing_run_dir_or_error(run_id)
     if error is not None:
@@ -247,26 +244,6 @@ def update_job_search_state_from_artifact(
     result["state_section_heading"] = state_section_heading
     return result
 
-
-def _merge_job_search_state_patch(patch: dict[str, Any]) -> dict[str, Any]:
-    patch = _compact_state_patch(patch)
-    LATEST_DIR.mkdir(parents=True, exist_ok=True)
-    state = _read_state()
-    now = _now_iso()
-
-    if isinstance(patch.get("jobs"), list):
-        state["jobs"] = _merge_jobs(state.get("jobs", []), patch["jobs"], now)
-
-    _write_state(state)
-
-    return {
-        "success": True,
-        "file_path": str(LATEST_DIR / "job_search_state.json"),
-        "job_count": len(state["jobs"]),
-        "merged_job_count": len(patch.get("jobs", [])) if isinstance(patch.get("jobs"), list) else 0,
-    }
-
-
 @tool
 def read_job_search_dedupe_state(limit: int = MAX_DEDUPE_STATE_JOBS) -> dict[str, Any]:
     """Read compact job dedupe keys from latest/job_search_state.json."""
@@ -279,11 +256,22 @@ def read_job_search_dedupe_state(limit: int = MAX_DEDUPE_STATE_JOBS) -> dict[str
     selected_jobs = _select_dedupe_jobs(jobs, clean_limit)
     return {
         "success": True,
-        "file_path": str(LATEST_DIR / "job_search_state.json"),
+        "file_path": str(_state_file_path()),
         "job_count": len(jobs),
         "returned_job_count": len(selected_jobs),
         "jobs": selected_jobs,
         "dedupe_brief": _dedupe_brief(selected_jobs),
+    }
+
+
+# Run and workspace path helpers
+
+
+def _unsupported_artifact_error(file_name: str) -> dict[str, Any]:
+    return {
+        "success": False,
+        "file_name": file_name,
+        "error": f"Unsupported artifact file. Expected one of: {sorted(ARTIFACT_FILES)}",
     }
 
 
@@ -378,8 +366,34 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
     return True
 
 
+# State persistence and merging
+
+
+def _merge_job_search_state_patch(patch: dict[str, Any]) -> dict[str, Any]:
+    patch = _compact_state_patch(patch)
+    LATEST_DIR.mkdir(parents=True, exist_ok=True)
+    state = _read_state()
+    now = _now_iso()
+
+    if isinstance(patch.get("jobs"), list):
+        state["jobs"] = _merge_jobs(state.get("jobs", []), patch["jobs"], now)
+
+    _write_state(state)
+
+    return {
+        "success": True,
+        "file_path": str(_state_file_path()),
+        "job_count": len(state["jobs"]),
+        "merged_job_count": len(patch.get("jobs", [])) if isinstance(patch.get("jobs"), list) else 0,
+    }
+
+
+def _state_file_path() -> Path:
+    return LATEST_DIR / STATE_FILE_NAME
+
+
 def _ensure_state_file() -> None:
-    path = LATEST_DIR / "job_search_state.json"
+    path = _state_file_path()
     if not path.exists():
         _write_state(_empty_state())
 
@@ -391,7 +405,7 @@ def _empty_state() -> dict[str, Any]:
 
 
 def _read_state() -> dict[str, Any]:
-    path = LATEST_DIR / "job_search_state.json"
+    path = _state_file_path()
     if not path.exists():
         return _empty_state()
     try:
@@ -409,10 +423,13 @@ def _read_state() -> dict[str, Any]:
 
 def _write_state(state: dict[str, Any]) -> None:
     LATEST_DIR.mkdir(parents=True, exist_ok=True)
-    (LATEST_DIR / "job_search_state.json").write_text(
+    _state_file_path().write_text(
         json.dumps(state, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+# Markdown and JSON parsing
 
 
 def _loads_jsonish(value: str) -> Any:
@@ -468,13 +485,15 @@ def _loads_jsonish_from_markdown_section(markdown: str, heading: str = "") -> An
     return _loads_jsonish(section)
 
 
+# Final report URL repair
+
+
 def _repair_final_report_urls(content: str, run_dir: Path) -> str:
     records = _load_report_url_records(run_dir)
     if not records or "URL not supplied" not in content:
         return content
 
     repaired_lines: list[str] = []
-    header_cells: list[str] = []
     header_indexes: dict[str, int] = {}
 
     for line in content.splitlines(keepends=True):
@@ -482,17 +501,13 @@ def _repair_final_report_urls(content: str, run_dir: Path) -> str:
         newline = "\n" if line.endswith("\n") else ""
         cells = _split_markdown_table_row(line_body)
         if not cells:
-            header_cells = []
             header_indexes = {}
             repaired_lines.append(line)
             continue
 
-        if "url" in {_normalize_table_header(cell) for cell in cells}:
-            header_cells = cells
-            header_indexes = {
-                _normalize_table_header(cell): index
-                for index, cell in enumerate(header_cells)
-            }
+        next_header_indexes = _markdown_table_header_indexes(cells)
+        if next_header_indexes is not None:
+            header_indexes = next_header_indexes
             repaired_lines.append(line)
             continue
 
@@ -500,27 +515,43 @@ def _repair_final_report_urls(content: str, run_dir: Path) -> str:
             repaired_lines.append(line)
             continue
 
-        url_index = header_indexes.get("url")
-        if url_index is None or url_index >= len(cells):
+        if not _repair_report_url_cells(cells, header_indexes, records):
             repaired_lines.append(line)
             continue
 
-        if _normalize_report_url_placeholder(cells[url_index]) not in REPORT_URL_PLACEHOLDER_VALUES:
-            repaired_lines.append(line)
-            continue
-
-        role = _cell_by_header(cells, header_indexes, "role")
-        company = _cell_by_header(cells, header_indexes, "company")
-        status = _cell_by_header(cells, header_indexes, "verification status")
-        match = _best_report_url_record(records, role=role, company=company, status=status)
-        if match is None:
-            repaired_lines.append(line)
-            continue
-
-        cells[url_index] = _markdown_link("Job page", match["url"])
         repaired_lines.append(_join_markdown_table_row(cells) + newline)
 
     return "".join(repaired_lines)
+
+
+def _markdown_table_header_indexes(cells: list[str]) -> dict[str, int] | None:
+    if "url" not in {_normalize_table_header(cell) for cell in cells}:
+        return None
+    return {_normalize_table_header(cell): index for index, cell in enumerate(cells)}
+
+
+def _repair_report_url_cells(
+    cells: list[str],
+    header_indexes: dict[str, int],
+    records: list[dict[str, str]],
+) -> bool:
+    url_index = header_indexes.get("url")
+    if url_index is None or url_index >= len(cells):
+        return False
+
+    placeholder = _normalize_report_url_placeholder(cells[url_index])
+    if placeholder not in REPORT_URL_PLACEHOLDER_VALUES:
+        return False
+
+    role = _cell_by_header(cells, header_indexes, "role")
+    company = _cell_by_header(cells, header_indexes, "company")
+    status = _cell_by_header(cells, header_indexes, "verification status")
+    match = _best_report_url_record(records, role=role, company=company, status=status)
+    if match is None:
+        return False
+
+    cells[url_index] = _markdown_link("Job page", match["url"])
+    return True
 
 
 def _load_report_url_records(run_dir: Path) -> list[dict[str, str]]:
@@ -668,7 +699,7 @@ def _best_report_url_record(
             best_record = record
             best_score = score
 
-    return best_record if best_score >= 0.65 else None
+    return best_record if best_score >= FINAL_REPORT_URL_MATCH_THRESHOLD else None
 
 
 def _report_url_match_score(
@@ -750,6 +781,9 @@ def _merge_dict(base: Any, patch: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+# State patch compaction
+
+
 def _compact_state_patch(patch: dict[str, Any]) -> dict[str, Any]:
     compacted: dict[str, Any] = {}
     if isinstance(patch.get("jobs"), list):
@@ -773,7 +807,11 @@ def _compact_job_for_state(job: dict[str, Any]) -> dict[str, Any]:
         "verification_status": job.get("verification_status"),
         "status": job.get("status"),
     }
-    next_job["source_urls"] = _compact_string_list(next_job.get("source_urls"), limit=MAX_STATE_SOURCE_URLS, max_chars=500)
+    next_job["source_urls"] = _compact_string_list(
+        next_job.get("source_urls"),
+        limit=MAX_STATE_SOURCE_URLS,
+        max_chars=500,
+    )
     return next_job
 
 
@@ -816,6 +854,9 @@ def _truncate_text(value: Any, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 1].rstrip() + "…"
+
+
+# Job state merge and dedupe records
 
 
 def _merge_jobs(existing_jobs: list[Any], incoming_jobs: list[Any], now: str) -> list[dict[str, Any]]:
@@ -949,6 +990,9 @@ def _should_reactivate_closed_status(
     )
 
 
+# Company state merge helpers
+
+
 def _merge_companies(existing_companies: list[Any], incoming_companies: list[Any], now: str) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     for item in existing_companies:
@@ -986,6 +1030,9 @@ def _should_keep_existing_company_value(key: str, existing_value: Any, incoming_
     return not _has_meaningful_value(incoming_value)
 
 
+# Normalization and identity helpers
+
+
 def _normalize_job(job: dict[str, Any], now: str) -> dict[str, Any]:
     next_job = dict(job)
     next_job.setdefault("title", "")
@@ -1012,20 +1059,15 @@ def _normalize_job(job: dict[str, Any], now: str) -> dict[str, Any]:
 
 
 def _status_from_verification(job: dict[str, Any]) -> str:
-    verification_status = str(job.get("verification_status") or "").strip().lower()
-    if verification_status in VERIFICATION_STATUSES_THAT_PROVE_CLOSED:
-        return "closed"
-    if verification_status in VERIFICATION_STATUSES_THAT_PROVE_ACTIVE:
-        return "active"
-    if verification_status in VERIFICATION_STATUSES_WITH_UNKNOWN_LIFECYCLE:
-        return "unknown"
-    return "active"
+    return _lifecycle_status_from_verification(job.get("verification_status")) or "active"
 
 
 def _status_from_explicit_verification(job: dict[str, Any]) -> str | None:
-    verification_status = str(job.get("verification_status") or "").strip().lower()
-    if not verification_status:
-        return None
+    return _lifecycle_status_from_verification(job.get("verification_status"))
+
+
+def _lifecycle_status_from_verification(value: Any) -> str | None:
+    verification_status = str(value or "").strip().lower()
     if verification_status in VERIFICATION_STATUSES_THAT_PROVE_CLOSED:
         return "closed"
     if verification_status in VERIFICATION_STATUSES_THAT_PROVE_ACTIVE:
@@ -1148,6 +1190,7 @@ def _url_port(parsed: Any) -> int | None:
 
 def _normalize_url_list(value: Any) -> list[str]:
     values: list[str] = []
+    seen: set[str] = set()
     if isinstance(value, str):
         items = [value]
     elif isinstance(value, list):
@@ -1157,8 +1200,9 @@ def _normalize_url_list(value: Any) -> list[str]:
     for item in items:
         normalized = _normalize_canonical_url(item)
         key = _canonical_url_key(normalized)
-        if normalized and key and key not in {_canonical_url_key(existing) for existing in values}:
+        if normalized and key and key not in seen:
             values.append(normalized)
+            seen.add(key)
     return values
 
 
@@ -1191,6 +1235,9 @@ def _has_meaningful_value(value: Any) -> bool:
     if isinstance(value, (list, tuple, set)):
         return any(_has_meaningful_value(item) for item in value)
     return True
+
+
+# Dedupe state presentation
 
 
 def _select_dedupe_jobs(jobs: list[Any], limit: int) -> list[dict[str, Any]]:
@@ -1252,6 +1299,9 @@ def _dedupe_brief(jobs: list[dict[str, Any]]) -> str:
             f"- {company} | {title} | {location} | status={status} | last_seen={last_seen} | dedupe_key={dedupe_key} | url={canonical_url}"
         )
     return "\n".join(lines)
+
+
+# Tool registry
 
 
 WORKSPACE_TOOLS = [

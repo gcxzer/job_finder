@@ -27,6 +27,13 @@ MAX_CANDIDATE_LINKS = 80
 MAX_HEADINGS = 40
 SPARSE_CAPTCHA_TEXT_CHARS = 80
 MAX_HTML_BYTES = 2_000_000
+BROWSER_GOTO_TIMEOUT_MS = 25_000
+BROWSER_RENDER_WAIT_MS = 2_500
+CRAWLER_CACHE_SUFFIX = "crawler"
+BROWSER_CACHE_SUFFIX = "browser"
+CLOSED_HTTP_STATUS_CODES = {404, 410}
+BLOCKED_HTTP_STATUS_CODES = {401, 403, 429, 999}
+REDIRECT_HTTP_STATUS_CODES = {301, 302, 303, 307, 308}
 
 DESKTOP_USER_AGENTS = [
     (
@@ -56,6 +63,9 @@ TECHNICAL_BLOCKED_PATTERNS = {
 }
 
 
+# Public tool entry points
+
+
 @tool
 def fetch_job_page(url: str) -> dict[str, Any]:
     """Fetch a job page with HTTP and cache the HTML for later extraction."""
@@ -67,50 +77,28 @@ def fetch_job_page(url: str) -> dict[str, Any]:
     try:
         response, attempt_count = _fetch_with_reference_crawler(clean_url)
         html = _response_text(response)
-        html_file = _write_cached_html(clean_url, html, suffix="crawler")
+        html_file = _write_cached_html(clean_url, html, suffix=CRAWLER_CACHE_SUFFIX)
         text = _visible_text(html)
         blocked = _detect_blocked(html, response.status_code)
-        is_closed = response.status_code in {404, 410}
+        is_closed = response.status_code in CLOSED_HTTP_STATUS_CODES
         is_js_heavy = _is_js_heavy(html, text)
         verification_status = _fetch_verification_status(blocked["reason"], is_closed)
 
-        return {
-            "success": response.status_code < 400 and not blocked["is_blocked"] and not is_closed,
-            "url": clean_url,
-            "final_url": str(response.url),
-            "status_code": response.status_code,
-            "html_file": str(html_file),
-            "html_preview": html[:MAX_HTML_PREVIEW_CHARS],
-            "text_preview": text[:MAX_TEXT_PREVIEW_CHARS],
-            "text_length": len(text),
-            "is_js_heavy": is_js_heavy,
-            "anti_scraping": _detect_anti_scraping(html),
-            "verification_status": verification_status,
-            "blocked_reason": blocked["reason"],
-            "attempt_count": attempt_count,
-            "error": None if response.status_code < 400 else f"HTTP {response.status_code}",
-        }
+        return _fetch_job_page_result(
+            url=clean_url,
+            final_url=str(response.url),
+            status_code=response.status_code,
+            html_file=html_file,
+            html=html,
+            text=text,
+            blocked=blocked,
+            is_closed=is_closed,
+            is_js_heavy=is_js_heavy,
+            verification_status=verification_status,
+            attempt_count=attempt_count,
+        )
     except Exception as error:
-        return {
-            "success": False,
-            "url": clean_url,
-            "final_url": clean_url,
-            "status_code": 0,
-            "html_file": "",
-            "html_preview": "",
-            "text_preview": "",
-            "text_length": 0,
-            "is_js_heavy": False,
-            "anti_scraping": {
-                "detected_mechanisms": [],
-                "has_anti_scraping": False,
-                "recommendations": [],
-            },
-            "verification_status": "unverified",
-            "blocked_reason": "",
-            "attempt_count": 0,
-            "error": str(error),
-        }
+        return _fetch_job_page_error_result(clean_url, error)
 
 
 @tool
@@ -146,8 +134,7 @@ def browser_extract_job_page(url: str) -> dict[str, Any]:
         )
 
     try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
+        sync_playwright, playwright_timeout_error = _playwright_dependencies()
     except ImportError as error:
         return _unavailable_context(
             url=clean_url,
@@ -156,45 +143,22 @@ def browser_extract_job_page(url: str) -> dict[str, Any]:
         )
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(
-                user_agent=_random_user_agent(),
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
-                    "Upgrade-Insecure-Requests": "1",
-                },
+        rendered = _render_job_page_with_browser(
+            clean_url,
+            sync_playwright=sync_playwright,
+            playwright_timeout_error=playwright_timeout_error,
+        )
+        if rendered["error"]:
+            return _unavailable_context(
+                url=clean_url,
+                extraction_method="browser",
+                error=rendered["error"],
             )
-            route_guard = _PlaywrightUrlGuard()
-            page.route("**/*", route_guard.handle)
-            try:
-                response = page.goto(clean_url, wait_until="domcontentloaded", timeout=25000)
-                page.wait_for_timeout(2500)
-                final_url = page.url
-                final_url_error = public_http_url_error(final_url)
-                if final_url_error:
-                    browser.close()
-                    return _unavailable_context(
-                        url=clean_url,
-                        extraction_method="browser",
-                        error=f"Unsafe final URL: {final_url_error}",
-                    )
-                status_code = response.status if response is not None else 0
-                html = _limit_text_bytes(page.content(), MAX_HTML_BYTES)
-            except PlaywrightTimeoutError as error:
-                browser.close()
-                return _unavailable_context(
-                    url=clean_url,
-                    extraction_method="browser",
-                    error=f"Browser timeout: {error}",
-                )
-            finally:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
 
-        html_file = _write_cached_html(clean_url, html, suffix="browser")
+        html = str(rendered["html"])
+        final_url = str(rendered["final_url"])
+        status_code = int(rendered["status_code"])
+        html_file = _write_cached_html(clean_url, html, suffix=BROWSER_CACHE_SUFFIX)
         return _extract_job_posting(
             url=final_url,
             html=html,
@@ -208,6 +172,130 @@ def browser_extract_job_page(url: str) -> dict[str, Any]:
             extraction_method="browser",
             error=str(error),
         )
+
+
+# Fetching and browser helpers
+
+
+def _fetch_job_page_result(
+    *,
+    url: str,
+    final_url: str,
+    status_code: int,
+    html_file: Path,
+    html: str,
+    text: str,
+    blocked: dict[str, Any],
+    is_closed: bool,
+    is_js_heavy: bool,
+    verification_status: str,
+    attempt_count: int,
+) -> dict[str, Any]:
+    return {
+        "success": status_code < 400 and not blocked["is_blocked"] and not is_closed,
+        "url": url,
+        "final_url": final_url,
+        "status_code": status_code,
+        "html_file": str(html_file),
+        "html_preview": html[:MAX_HTML_PREVIEW_CHARS],
+        "text_preview": text[:MAX_TEXT_PREVIEW_CHARS],
+        "text_length": len(text),
+        "is_js_heavy": is_js_heavy,
+        "anti_scraping": _detect_anti_scraping(html),
+        "verification_status": verification_status,
+        "blocked_reason": blocked["reason"],
+        "attempt_count": attempt_count,
+        "error": None if status_code < 400 else f"HTTP {status_code}",
+    }
+
+
+def _fetch_job_page_error_result(url: str, error: Exception) -> dict[str, Any]:
+    return {
+        "success": False,
+        "url": url,
+        "final_url": url,
+        "status_code": 0,
+        "html_file": "",
+        "html_preview": "",
+        "text_preview": "",
+        "text_length": 0,
+        "is_js_heavy": False,
+        "anti_scraping": _empty_anti_scraping_result(),
+        "verification_status": "unverified",
+        "blocked_reason": "",
+        "attempt_count": 0,
+        "error": str(error),
+    }
+
+
+def _empty_anti_scraping_result() -> dict[str, Any]:
+    return {
+        "detected_mechanisms": [],
+        "has_anti_scraping": False,
+        "recommendations": [],
+    }
+
+
+def _playwright_dependencies() -> tuple[Any, Any]:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+
+    return sync_playwright, PlaywrightTimeoutError
+
+
+def _render_job_page_with_browser(
+    clean_url: str,
+    *,
+    sync_playwright: Any,
+    playwright_timeout_error: Any,
+) -> dict[str, Any]:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(
+                user_agent=_random_user_agent(),
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+            )
+            route_guard = _PlaywrightUrlGuard()
+            page.route("**/*", route_guard.handle)
+            try:
+                response = page.goto(
+                    clean_url,
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_GOTO_TIMEOUT_MS,
+                )
+                page.wait_for_timeout(BROWSER_RENDER_WAIT_MS)
+            except playwright_timeout_error as error:
+                return _browser_render_error(f"Browser timeout: {error}")
+
+            final_url = page.url
+            final_url_error = public_http_url_error(final_url)
+            if final_url_error:
+                return _browser_render_error(f"Unsafe final URL: {final_url_error}")
+
+            return {
+                "final_url": final_url,
+                "html": _limit_text_bytes(page.content(), MAX_HTML_BYTES),
+                "status_code": response.status if response is not None else 0,
+                "error": "",
+            }
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+def _browser_render_error(error: str) -> dict[str, Any]:
+    return {
+        "final_url": "",
+        "html": "",
+        "status_code": 0,
+        "error": error,
+    }
 
 
 def _fetch_with_reference_crawler(url: str) -> tuple[httpx.Response, int]:
@@ -251,7 +339,7 @@ def _fetch_with_checked_redirects(url: str, *, max_redirects: int = 8) -> httpx.
                     extensions=response.extensions,
                 )
 
-        if checked_response.status_code not in {301, 302, 303, 307, 308}:
+        if checked_response.status_code not in REDIRECT_HTTP_STATUS_CODES:
             return checked_response
 
         location = checked_response.headers.get("location", "").strip()
@@ -341,6 +429,9 @@ def _limit_text_bytes(text: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
+# Extraction context builders
+
+
 def _extract_job_posting(
     url: str,
     html: str,
@@ -364,14 +455,7 @@ def _extract_job_posting(
         "technical_status": technical_status,
         "verification_status": _context_verification_status(technical_status),
         "standard_extraction": standard_extraction,
-        "page_context": {
-            "visible_text": text[:MAX_VISIBLE_TEXT_CHARS],
-            "visible_text_truncated": len(text) > MAX_VISIBLE_TEXT_CHARS,
-            "text_length": len(text),
-            "candidate_links": _candidate_links(soup, url),
-            "headings": _headings(soup),
-            "html_file": html_file,
-        },
+        "page_context": _page_context(soup=soup, url=url, text=text, html_file=html_file),
         "technical_signals": technical_signals,
         "verified_at": _now_iso(),
         "error": None if technical_status == "readable" else technical_status,
@@ -393,30 +477,53 @@ def _unavailable_context(
         "extraction_method": extraction_method,
         "technical_status": "unavailable",
         "verification_status": "unverified",
-        "standard_extraction": {
-            "canonical_url": url,
-            "html_title": "",
-            "meta": {},
-            "json_ld_jobposting": {},
-        },
-        "page_context": {
-            "visible_text": "",
-            "visible_text_truncated": False,
-            "text_length": 0,
-            "candidate_links": [],
-            "headings": [],
-            "html_file": html_file,
-        },
-        "technical_signals": {
-            "status_code": 0,
-            "detected_mechanisms": [],
-            "has_anti_scraping": False,
-            "is_js_heavy": False,
-            "is_blocked": False,
-            "blocked_reason": "",
-        },
+        "standard_extraction": _empty_standard_extraction(url),
+        "page_context": _empty_page_context(html_file),
+        "technical_signals": _empty_technical_signals(),
         "verified_at": _now_iso(),
         "error": error,
+    }
+
+
+def _page_context(*, soup: BeautifulSoup, url: str, text: str, html_file: str) -> dict[str, Any]:
+    return {
+        "visible_text": text[:MAX_VISIBLE_TEXT_CHARS],
+        "visible_text_truncated": len(text) > MAX_VISIBLE_TEXT_CHARS,
+        "text_length": len(text),
+        "candidate_links": _candidate_links(soup, url),
+        "headings": _headings(soup),
+        "html_file": html_file,
+    }
+
+
+def _empty_page_context(html_file: str = "") -> dict[str, Any]:
+    return {
+        "visible_text": "",
+        "visible_text_truncated": False,
+        "text_length": 0,
+        "candidate_links": [],
+        "headings": [],
+        "html_file": html_file,
+    }
+
+
+def _empty_standard_extraction(url: str) -> dict[str, Any]:
+    return {
+        "canonical_url": url,
+        "html_title": "",
+        "meta": {},
+        "json_ld_jobposting": {},
+    }
+
+
+def _empty_technical_signals() -> dict[str, Any]:
+    return {
+        "status_code": 0,
+        "detected_mechanisms": [],
+        "has_anti_scraping": False,
+        "is_js_heavy": False,
+        "is_blocked": False,
+        "blocked_reason": "",
     }
 
 
@@ -498,6 +605,9 @@ def _headings(soup: BeautifulSoup) -> list[dict[str, str]]:
     return headings
 
 
+# Workspace cache helpers
+
+
 def _write_cached_html(url: str, html: str, suffix: str) -> Path:
     PAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
@@ -533,11 +643,20 @@ def _resolve_workspace_file(file_path: str) -> Path | None:
         path = raw_path if raw_path.is_absolute() else WORKSPACE_DIR / clean_path.lstrip("/")
 
     resolved = path.resolve()
-    try:
-        resolved.relative_to(WORKSPACE_DIR)
-    except ValueError:
+    if not _is_relative_to(resolved, WORKSPACE_DIR):
         return None
     return resolved
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+# Text helpers
 
 
 def _visible_text(html: str) -> str:
@@ -555,10 +674,13 @@ def _collapse_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+# Technical status and anti-scraping signals
+
+
 def _detect_blocked(html: str, status_code: int) -> dict[str, Any]:
     lowered = (html or "").lower()
     visible_text_length = len(_visible_text(html).strip())
-    if status_code in {401, 403, 429, 999}:
+    if status_code in BLOCKED_HTTP_STATUS_CODES:
         return {"is_blocked": True, "reason": f"HTTP {status_code}"}
     if _has_cloudflare_challenge(lowered):
         return {"is_blocked": True, "reason": "cloudflare"}
@@ -609,23 +731,18 @@ def _technical_signals(
     has_captcha_widget = _has_captcha_widget(lowered)
     is_sparse_captcha_page = has_captcha_widget and len(text.strip()) < SPARSE_CAPTCHA_TEXT_CHARS
     is_js_heavy = _is_js_heavy(html, text)
-    detected = []
-    if status_code in {401, 403, 429, 999}:
-        detected.append(f"HTTP {status_code}")
-    if status_code in {404, 410}:
-        detected.append(f"HTTP {status_code} closed")
-    if has_cloudflare:
-        detected.append("Cloudflare")
-    if has_captcha_widget:
-        detected.append("CAPTCHA widget")
-    if is_js_heavy:
-        detected.append("JavaScript Rendering")
+    detected = _detected_technical_mechanisms(
+        status_code=status_code,
+        has_cloudflare=has_cloudflare,
+        has_captcha_widget=has_captcha_widget,
+        is_js_heavy=is_js_heavy,
+    )
 
     return {
         "status_code": status_code,
         "detected_mechanisms": detected,
         "has_anti_scraping": bool(
-            status_code in {401, 403, 429, 999}
+            status_code in BLOCKED_HTTP_STATUS_CODES
             or has_cloudflare
             or has_captcha_widget
             or is_js_heavy
@@ -637,6 +754,27 @@ def _technical_signals(
         "is_blocked": bool(blocked.get("is_blocked")),
         "blocked_reason": str(blocked.get("reason") or ""),
     }
+
+
+def _detected_technical_mechanisms(
+    *,
+    status_code: int,
+    has_cloudflare: bool,
+    has_captcha_widget: bool,
+    is_js_heavy: bool,
+) -> list[str]:
+    detected = []
+    if status_code in BLOCKED_HTTP_STATUS_CODES:
+        detected.append(f"HTTP {status_code}")
+    if status_code in CLOSED_HTTP_STATUS_CODES:
+        detected.append(f"HTTP {status_code} closed")
+    if has_cloudflare:
+        detected.append("Cloudflare")
+    if has_captcha_widget:
+        detected.append("CAPTCHA widget")
+    if is_js_heavy:
+        detected.append("JavaScript Rendering")
+    return detected
 
 
 def _has_captcha_widget(lowered_html: str) -> bool:
@@ -654,7 +792,7 @@ def _has_cloudflare_challenge(lowered_html: str) -> bool:
 
 
 def _technical_status(status_code: int, blocked_reason: str) -> str:
-    if status_code in {404, 410}:
+    if status_code in CLOSED_HTTP_STATUS_CODES:
         return "closed_http"
     if blocked_reason == "HTTP 401":
         return "login_required"
@@ -691,6 +829,9 @@ def _is_js_heavy(html: str, text: str) -> bool:
     soup = BeautifulSoup(html or "", "lxml")
     script_count = len(soup.find_all("script"))
     return script_count >= 8 and len(text.strip()) < 800
+
+
+# JSON-LD extraction helpers
 
 
 def _find_jobposting_json_ld(soup: BeautifulSoup) -> dict[str, Any] | None:
@@ -765,6 +906,9 @@ def _unsafe_output_url(url: str) -> bool:
     return bool(public_http_url_error(url, resolve_dns=False))
 
 
+# JSON-LD value formatting
+
+
 def _location_text(value: Any) -> str:
     if isinstance(value, list):
         return "; ".join(filter(None, [_location_text(item) for item in value]))
@@ -824,6 +968,9 @@ def _as_text(value: Any) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+# Tool registry
 
 
 JOB_PAGE_TOOLS = [
