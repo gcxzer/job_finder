@@ -127,6 +127,8 @@ class CodexOAuthChatModel(BaseChatModel):
         # forwarded here.
 
         payload.update({key: value for key, value in self.request_options.items() if value is not None})
+        if payload.get("store") is False:
+            payload["include"] = _include_reasoning_encrypted_content(payload.get("include"))
         return _strip_none(payload)
 
     def _create_response(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -281,6 +283,18 @@ def _responses_tools(tools: Sequence[Any]) -> list[dict[str, Any]]:
     return converted
 
 
+def _include_reasoning_encrypted_content(include: Any) -> list[str]:
+    values: list[str] = []
+    if isinstance(include, str):
+        values.append(include)
+    elif isinstance(include, list | tuple | set):
+        values.extend(str(value) for value in include if value)
+
+    if "reasoning.encrypted_content" not in values:
+        values.append("reasoning.encrypted_content")
+    return values
+
+
 _BUILT_IN_RESPONSE_TOOLS = {
     "web_search",
     "web_search_2025_08_26",
@@ -421,11 +435,76 @@ def _response_output_items_from_message(message: AIMessage) -> list[dict[str, An
     output_items = message.additional_kwargs.get("response_output_items")
     if not isinstance(output_items, list):
         return []
-    return [deepcopy(item) for item in output_items if _is_response_output_item(item)]
+    replay_items: list[dict[str, Any]] = []
+    for item in output_items:
+        replay_item = _replayable_response_output_item(item)
+        if replay_item:
+            replay_items.append(replay_item)
+    return replay_items
 
 
 def _is_response_output_item(item: Any) -> bool:
     return isinstance(item, dict) and isinstance(item.get("type"), str)
+
+
+def _replayable_response_output_item(item: Any) -> dict[str, Any] | None:
+    if not _is_response_output_item(item):
+        return None
+
+    item_type = str(item.get("type") or "")
+    if item_type == "reasoning":
+        encrypted_content = item.get("encrypted_content")
+        item_id = str(item.get("id") or "").strip()
+        if not item_id or not isinstance(encrypted_content, str) or not encrypted_content:
+            return None
+        replay_item: dict[str, Any] = {
+            "type": "reasoning",
+            "id": item_id,
+            "summary": deepcopy(item.get("summary") if isinstance(item.get("summary"), list) else []),
+            "encrypted_content": encrypted_content,
+        }
+        if isinstance(item.get("status"), str):
+            replay_item["status"] = item["status"]
+        return replay_item
+
+    if item_type == "function_call":
+        return _replayable_tool_call_item(item, argument_key="arguments")
+
+    if item_type == "custom_tool_call":
+        return _replayable_tool_call_item(item, argument_key="input")
+
+    if item_type == "message":
+        content = item.get("content")
+        if not isinstance(content, str | list):
+            return None
+        replay_item = {
+            "type": "message",
+            "role": str(item.get("role") or "assistant"),
+            "content": deepcopy(content),
+        }
+        for optional_key in ("status", "phase"):
+            if isinstance(item.get(optional_key), str):
+                replay_item[optional_key] = item[optional_key]
+        return replay_item
+
+    return None
+
+
+def _replayable_tool_call_item(item: dict[str, Any], *, argument_key: str) -> dict[str, Any] | None:
+    call_id = str(item.get("call_id") or _call_id_from_item_id(item.get("id"))).strip()
+    name = str(item.get("name") or "").strip()
+    if not call_id or not name:
+        return None
+    arguments = item.get(argument_key)
+    replay_item = {
+        "type": str(item.get("type") or ""),
+        "call_id": call_id,
+        "name": name,
+        argument_key: arguments if isinstance(arguments, str) else json.dumps(arguments or {}, ensure_ascii=False),
+    }
+    if isinstance(item.get("status"), str):
+        replay_item["status"] = item["status"]
+    return replay_item
 
 
 def _message_output_text(item: dict[str, Any]) -> list[str]:

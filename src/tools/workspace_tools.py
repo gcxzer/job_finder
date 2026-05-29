@@ -25,9 +25,8 @@ ARTIFACT_FILES = {
 }
 RUN_ID_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}(?:_\d+)?\Z")
 
-MAX_STATE_REQUIREMENTS = 5
-MAX_STATE_REQUIREMENT_CHARS = 160
 MAX_STATE_SOURCE_URLS = 8
+MAX_DEDUPE_STATE_JOBS = 60
 PLACEHOLDER_TEXT_VALUES = {
     "",
     "n/a",
@@ -120,7 +119,7 @@ def save_job_artifact(run_id: str, file_name: str, content: str) -> dict[str, An
 
 @tool
 def update_job_search_state(run_id: str, state_patch_json: str) -> dict[str, Any]:
-    """Merge a JSON state patch into latest/job_search_state.json."""
+    """Merge job dedupe keys into latest/job_search_state.json."""
     _run_dir, error = _existing_run_dir_or_error(run_id)
     if error is not None:
         return error
@@ -137,26 +136,36 @@ def update_job_search_state(run_id: str, state_patch_json: str) -> dict[str, Any
     LATEST_DIR.mkdir(parents=True, exist_ok=True)
     state = _read_state()
     now = _now_iso()
-    state["updated_at"] = now
-
-    if isinstance(patch.get("candidate"), dict):
-        state["candidate"] = _merge_dict(state.get("candidate", {}), patch["candidate"])
 
     if isinstance(patch.get("jobs"), list):
         state["jobs"] = _merge_jobs(state.get("jobs", []), patch["jobs"], now)
 
-    if isinstance(patch.get("companies"), list):
-        state["companies"] = _merge_companies(state.get("companies", []), patch["companies"], now)
-
-    _upsert_run(state, run_id, patch.get("run"))
     _write_state(state)
 
     return {
         "success": True,
         "file_path": str(LATEST_DIR / "job_search_state.json"),
         "job_count": len(state["jobs"]),
-        "company_count": len(state["companies"]),
-        "run_count": len(state["runs"]),
+    }
+
+
+@tool
+def read_job_search_dedupe_state(limit: int = MAX_DEDUPE_STATE_JOBS) -> dict[str, Any]:
+    """Read compact job dedupe keys from latest/job_search_state.json."""
+    state = _read_state()
+    jobs = state.get("jobs", [])
+    if not isinstance(jobs, list):
+        jobs = []
+
+    clean_limit = max(0, min(int(limit or 0), MAX_DEDUPE_STATE_JOBS))
+    selected_jobs = [job for job in jobs if isinstance(job, dict)][-clean_limit:] if clean_limit else []
+    return {
+        "success": True,
+        "file_path": str(LATEST_DIR / "job_search_state.json"),
+        "job_count": len(jobs),
+        "returned_job_count": len(selected_jobs),
+        "jobs": selected_jobs,
+        "dedupe_brief": _dedupe_brief(selected_jobs),
     }
 
 
@@ -259,12 +268,7 @@ def _ensure_state_file() -> None:
 
 def _empty_state() -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "updated_at": _now_iso(),
-        "candidate": {},
         "jobs": [],
-        "companies": [],
-        "runs": [],
     }
 
 
@@ -278,13 +282,11 @@ def _read_state() -> dict[str, Any]:
         return _empty_state()
     if not isinstance(state, dict):
         return _empty_state()
-    state.setdefault("schema_version", 1)
-    state.setdefault("updated_at", _now_iso())
-    state.setdefault("candidate", {})
-    state.setdefault("jobs", [])
-    state.setdefault("companies", [])
-    state.setdefault("runs", [])
-    return state
+    jobs = state.get("jobs")
+    if not isinstance(jobs, list):
+        jobs = []
+    now = _now_iso()
+    return {"jobs": [_job_dedupe_record(_normalize_job(job, now)) for job in jobs if isinstance(job, dict)]}
 
 
 def _write_state(state: dict[str, Any]) -> None:
@@ -336,41 +338,27 @@ def _merge_dict(base: Any, patch: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_state_patch(patch: dict[str, Any]) -> dict[str, Any]:
-    compacted = dict(patch)
-    if isinstance(compacted.get("jobs"), list):
+    compacted: dict[str, Any] = {}
+    if isinstance(patch.get("jobs"), list):
         compacted["jobs"] = [
             _compact_job_for_state(job)
-            for job in compacted["jobs"]
+            for job in patch["jobs"]
             if isinstance(job, dict)
-        ]
-    if isinstance(compacted.get("companies"), list):
-        compacted["companies"] = [
-            _compact_company_for_state(company)
-            for company in compacted["companies"]
-            if isinstance(company, dict)
         ]
     return compacted
 
 
 def _compact_job_for_state(job: dict[str, Any]) -> dict[str, Any]:
-    next_job = dict(job)
-    next_job.pop("description", None)
-    next_job.pop("description_summary", None)
-    next_job.pop("html", None)
-    next_job.pop("html_preview", None)
-    next_job.pop("text_preview", None)
-    next_job.pop("raw_text", None)
-    next_job.pop("page_text", None)
-    next_job["requirements"] = _compact_string_list(
-        next_job.get("requirements"),
-        limit=MAX_STATE_REQUIREMENTS,
-        max_chars=MAX_STATE_REQUIREMENT_CHARS,
-    )
-    next_job["source_urls"] = _compact_string_list(
-        next_job.get("source_urls"),
-        limit=MAX_STATE_SOURCE_URLS,
-        max_chars=500,
-    )
+    next_job = {
+        "title": job.get("title"),
+        "company": job.get("company"),
+        "location": job.get("location"),
+        "canonical_url": job.get("canonical_url") or job.get("final_url") or job.get("url"),
+        "source_urls": job.get("source_urls"),
+        "dedupe_key": job.get("dedupe_key") or job.get("duplicate_key"),
+        "duplicate_key": job.get("duplicate_key") or job.get("dedupe_key"),
+    }
+    next_job["source_urls"] = _compact_string_list(next_job.get("source_urls"), limit=MAX_STATE_SOURCE_URLS, max_chars=500)
     return next_job
 
 
@@ -439,7 +427,7 @@ def _merge_jobs(existing_jobs: list[Any], incoming_jobs: list[Any], now: str) ->
         if job.get("canonical_url"):
             by_url[_canonical_url_key(job["canonical_url"])] = key
 
-    return list(merged.values())
+    return [_job_dedupe_record(job) for job in merged.values()]
 
 
 def _existing_job_key(
@@ -453,10 +441,10 @@ def _existing_job_key(
     job_id = str(job["job_id"])
     if job_id in merged:
         return job_id
-    duplicate_key = str(job.get("duplicate_key") or "").strip()
+    duplicate_key = str(job.get("duplicate_key") or job.get("dedupe_key") or "").strip()
     if duplicate_key:
         for candidate_key, candidate in merged.items():
-            if str(candidate.get("duplicate_key") or "").strip() == duplicate_key:
+            if str(candidate.get("duplicate_key") or candidate.get("dedupe_key") or "").strip() == duplicate_key:
                 return candidate_key
     return job_id
 
@@ -481,6 +469,19 @@ def _merge_job(existing: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     else:
         next_job.setdefault("status", "active")
     return next_job
+
+
+def _job_dedupe_record(job: dict[str, Any]) -> dict[str, Any]:
+    source_urls = _compact_string_list(job.get("source_urls"), limit=MAX_STATE_SOURCE_URLS, max_chars=500)
+    record = {
+        "title": str(job.get("title") or "").strip(),
+        "company": str(job.get("company") or "").strip(),
+        "location": str(job.get("location") or "").strip(),
+        "canonical_url": str(job.get("canonical_url") or "").strip(),
+        "source_urls": source_urls,
+        "dedupe_key": str(job.get("dedupe_key") or job.get("duplicate_key") or "").strip(),
+    }
+    return {key: value for key, value in record.items() if _has_meaningful_value(value)}
 
 
 def _merge_job_fields(existing: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
@@ -558,8 +559,6 @@ def _normalize_job(job: dict[str, Any], now: str) -> dict[str, Any]:
     next_job.setdefault("first_seen_at", _today())
     next_job.setdefault("last_seen_at", _today())
     next_job.setdefault("status", _status_from_verification(next_job))
-    next_job.setdefault("requirements", [])
-    next_job.setdefault("confidence", "Unspecified")
     next_job.setdefault("updated_at", now)
     return next_job
 
@@ -647,30 +646,24 @@ def _has_meaningful_value(value: Any) -> bool:
     return True
 
 
-def _upsert_run(state: dict[str, Any], run_id: str, run_patch: Any) -> None:
-    run = {
-        "run_id": run_id,
-        "updated_at": _now_iso(),
-        "outputs": {
-            "intake_brief": f"workspace/runs/{run_id}/01_intake_brief.md",
-            "raw_job_results": f"workspace/runs/{run_id}/02_raw_job_results.md",
-            "verified_job_results": f"workspace/runs/{run_id}/03_verified_job_results.md",
-            "resume_match_report": f"workspace/runs/{run_id}/04_resume_match_report.md",
-            "company_research": f"workspace/runs/{run_id}/05_company_research.md",
-            "final_report": f"workspace/runs/{run_id}/06_final_job_search_report.md",
-        },
-    }
-    if isinstance(run_patch, dict):
-        run = _merge_dict(run, run_patch)
-
-    runs = [item for item in state.get("runs", []) if isinstance(item, dict) and item.get("run_id") != run_id]
-    runs.append(run)
-    state["runs"] = runs
+def _dedupe_brief(jobs: list[dict[str, Any]]) -> str:
+    if not jobs:
+        return "No previous job dedupe records."
+    lines = ["Known previous job dedupe records:"]
+    for job in jobs:
+        title = job.get("title") or "Unknown title"
+        company = job.get("company") or "Unknown company"
+        location = job.get("location") or "Unknown location"
+        dedupe_key = job.get("dedupe_key") or ""
+        canonical_url = job.get("canonical_url") or ""
+        lines.append(f"- {company} | {title} | {location} | dedupe_key={dedupe_key} | url={canonical_url}")
+    return "\n".join(lines)
 
 
 WORKSPACE_TOOLS = [
     start_workspace_run,
     save_workspace_file,
     save_job_artifact,
+    read_job_search_dedupe_state,
     update_job_search_state,
 ]

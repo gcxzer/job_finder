@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, ToolMessage
 
 from src.codex_oauth.auth import CodexAuthError, CodexAuthStore
 from src.codex_oauth.chat_model import (
+    CodexOAuthChatModel,
     _collect_stream_response,
     _messages_to_responses_input,
     _raise_for_response_error,
@@ -54,7 +55,15 @@ class CodexOAuthChatModelTests(unittest.TestCase):
 
         self.assertEqual(_response_to_ai_message(response).content, "hello")
 
-    def test_response_output_items_are_replayed_unchanged_for_stateless_tool_turns(self) -> None:
+    def test_payload_requests_encrypted_reasoning_for_stateless_turns(self) -> None:
+        model = CodexOAuthChatModel()
+
+        payload = model._build_payload([HumanMessage(content="Find this job.")])
+
+        self.assertFalse(payload["store"])
+        self.assertIn("reasoning.encrypted_content", payload["include"])
+
+    def test_response_output_items_are_sanitized_for_stateless_tool_turns(self) -> None:
         function_call_item = {
             "type": "function_call",
             "id": "fc_123",
@@ -86,17 +95,65 @@ class CodexOAuthChatModelTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(input_items[1], response["output"][0])
-        self.assertEqual(input_items[2], function_call_item)
-        self.assertEqual(input_items[2]["phase"], "tool_calling")
         self.assertEqual(
-            input_items[3],
+            input_items[1],
+            {
+                "type": "function_call",
+                "call_id": "call_123",
+                "name": "lookup_job",
+                "arguments": '{"url": "https://example.com/jobs/1"}',
+            },
+        )
+        self.assertEqual(
+            input_items[2],
             {
                 "type": "function_call_output",
                 "call_id": "call_123",
                 "output": '{"success": true}',
             },
         )
+
+    def test_encrypted_reasoning_items_are_replayed_for_stateless_tool_turns(self) -> None:
+        response = {
+            "id": "resp_123",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_123",
+                    "summary": [],
+                    "encrypted_content": "encrypted",
+                    "phase": "reasoning",
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_123",
+                    "call_id": "call_123",
+                    "name": "lookup_job",
+                    "arguments": '{"url": "https://example.com/jobs/1"}',
+                },
+            ],
+        }
+        ai_message = _response_to_ai_message(response)
+
+        _instructions, input_items = _messages_to_responses_input(
+            [
+                HumanMessage(content="Find this job."),
+                ai_message,
+                ToolMessage(content='{"success": true}', tool_call_id="call_123"),
+            ]
+        )
+
+        self.assertEqual(
+            input_items[1],
+            {
+                "type": "reasoning",
+                "id": "rs_123",
+                "summary": [],
+                "encrypted_content": "encrypted",
+            },
+        )
+        self.assertEqual(input_items[2]["type"], "function_call")
 
     def test_runtime_credentials_refreshes_when_only_refresh_token_is_stored(self) -> None:
         with TemporaryDirectory() as temp_dir:

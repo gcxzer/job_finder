@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import tomllib
@@ -95,12 +96,83 @@ class WorkspaceToolsTests(unittest.TestCase):
                 result = workspace_tools.update_job_search_state.invoke(
                     {
                         "run_id": run_id,
-                        "state_patch_json": '{"jobs": [{"title": "Backend Engineer", "company": "Acme"}]}',
+                        "state_patch_json": (
+                            '{"jobs": [{"title": "Backend Engineer", "company": "Acme", '
+                            '"location": "Leipzig", "canonical_url": "https://acme.example/jobs/1", '
+                            '"requirements": ["Python"], "match_score": 88, "recommendation": "Apply"}], '
+                            '"companies": [{"name": "Acme"}], "run": {"completed_at": "2026-05-29"}}'
+                        ),
                     }
                 )
+                state = json.loads((latest_dir / "job_search_state.json").read_text(encoding="utf-8"))
 
         self.assertTrue(result["success"], result)
         self.assertEqual(result["job_count"], 1)
+        self.assertEqual(list(state), ["jobs"])
+        self.assertEqual(
+            set(state["jobs"][0]),
+            {"title", "company", "location", "canonical_url", "source_urls", "dedupe_key"},
+        )
+        self.assertNotIn("requirements", state["jobs"][0])
+        self.assertNotIn("match_score", state["jobs"][0])
+        self.assertNotIn("recommendation", state["jobs"][0])
+
+    def test_read_job_search_dedupe_state_returns_compact_brief(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            latest_dir = Path(temp_dir) / "latest"
+            latest_dir.mkdir(parents=True)
+            (latest_dir / "job_search_state.json").write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "title": "Backend Engineer",
+                                "company": "Acme",
+                                "location": "Leipzig",
+                                "canonical_url": "https://acme.example/jobs/1",
+                                "dedupe_key": "acme|backend engineer|leipzig",
+                                "status": "active",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(workspace_tools, "LATEST_DIR", latest_dir):
+                result = workspace_tools.read_job_search_dedupe_state.invoke({"limit": 10})
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["job_count"], 1)
+        self.assertEqual(result["returned_job_count"], 1)
+        self.assertIn("acme|backend engineer|leipzig", result["dedupe_brief"])
+        self.assertEqual(result["jobs"][0]["canonical_url"], "https://acme.example/jobs/1")
+
+    def test_read_job_search_dedupe_state_returns_last_inserted_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            latest_dir = Path(temp_dir) / "latest"
+            latest_dir.mkdir(parents=True)
+            (latest_dir / "job_search_state.json").write_text(
+                json.dumps(
+                    {
+                        "jobs": [
+                            {
+                                "title": f"Job {index}",
+                                "company": "Acme",
+                                "location": "Leipzig",
+                                "canonical_url": f"https://acme.example/jobs/{index}",
+                            }
+                            for index in range(1, 5)
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(workspace_tools, "LATEST_DIR", latest_dir):
+                result = workspace_tools.read_job_search_dedupe_state.invoke({"limit": 2})
+
+        self.assertEqual([job["title"] for job in result["jobs"]], ["Job 3", "Job 4"])
 
     def test_loads_jsonish_prefers_explicit_json_fenced_block(self) -> None:
         payload = """
@@ -115,7 +187,7 @@ print("not json")
 
         self.assertEqual(workspace_tools._loads_jsonish(payload), {"jobs": []})
 
-    def test_merge_job_patch_preserves_existing_details(self) -> None:
+    def test_merge_job_patch_keeps_only_dedupe_details(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
         existing = [
             {
@@ -141,10 +213,15 @@ print("not json")
 
         merged = workspace_tools._merge_jobs(existing, match_patch, now)
 
-        self.assertEqual(merged[0]["requirements"], ["Python", "Docker"])
-        self.assertEqual(merged[0]["confidence"], "High")
-        self.assertEqual(merged[0]["match_score"], 80)
-        self.assertEqual(merged[0]["recommendation"], "Apply")
+        self.assertEqual(merged[0]["title"], "Backend Engineer")
+        self.assertEqual(merged[0]["company"], "Acme")
+        self.assertEqual(merged[0]["location"], "Leipzig")
+        self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
+        self.assertNotIn("status", merged[0])
+        self.assertNotIn("requirements", merged[0])
+        self.assertNotIn("confidence", merged[0])
+        self.assertNotIn("match_score", merged[0])
+        self.assertNotIn("recommendation", merged[0])
 
     def test_placeholder_list_values_do_not_replace_existing_job_details(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
@@ -174,9 +251,10 @@ print("not json")
 
         merged = workspace_tools._merge_jobs(existing, placeholder_patch["jobs"], now)
 
-        self.assertEqual(merged[0]["requirements"], ["Python", "Docker"])
+        self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
+        self.assertNotIn("requirements", merged[0])
 
-    def test_closed_verification_status_sets_lifecycle_status_closed(self) -> None:
+    def test_closed_verification_status_is_not_persisted_in_dedupe_state(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
 
         merged = workspace_tools._merge_jobs(
@@ -193,10 +271,11 @@ print("not json")
             now,
         )
 
-        self.assertEqual(merged[0]["status"], "closed")
-        self.assertEqual(merged[0]["verification_status"], "closed")
+        self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
+        self.assertNotIn("status", merged[0])
+        self.assertNotIn("verification_status", merged[0])
 
-    def test_verified_patch_reopens_previous_closed_status(self) -> None:
+    def test_verified_patch_keeps_only_dedupe_fields(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
         existing = [
             {
@@ -220,10 +299,11 @@ print("not json")
 
         merged = workspace_tools._merge_jobs(existing, verified_patch, now)
 
-        self.assertEqual(merged[0]["verification_status"], "verified")
-        self.assertEqual(merged[0]["status"], "active")
+        self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
+        self.assertNotIn("status", merged[0])
+        self.assertNotIn("verification_status", merged[0])
 
-    def test_sparse_match_patch_does_not_reopen_closed_status(self) -> None:
+    def test_sparse_match_patch_keeps_only_dedupe_fields(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
         existing = [
             {
@@ -248,11 +328,12 @@ print("not json")
 
         merged = workspace_tools._merge_jobs(existing, match_patch, now)
 
-        self.assertEqual(merged[0]["verification_status"], "closed")
-        self.assertEqual(merged[0]["status"], "closed")
-        self.assertEqual(merged[0]["match_score"], 83)
+        self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
+        self.assertNotIn("status", merged[0])
+        self.assertNotIn("verification_status", merged[0])
+        self.assertNotIn("match_score", merged[0])
 
-    def test_uncertain_verification_status_does_not_reopen_closed_status(self) -> None:
+    def test_uncertain_verification_status_is_not_persisted(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
         existing = [
             {
@@ -286,10 +367,11 @@ print("not json")
                     now,
                 )
 
-                self.assertEqual(merged[0]["status"], "closed")
-                self.assertEqual(merged[0]["verification_status"], verification_status)
+                self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
+                self.assertNotIn("status", merged[0])
+                self.assertNotIn("verification_status", merged[0])
 
-    def test_new_uncertain_verification_status_has_unknown_lifecycle_status(self) -> None:
+    def test_new_uncertain_verification_status_keeps_only_dedupe_fields(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
 
         merged = workspace_tools._merge_jobs(
@@ -306,10 +388,11 @@ print("not json")
             now,
         )
 
-        self.assertEqual(merged[0]["status"], "unknown")
-        self.assertEqual(merged[0]["verification_status"], "access_blocked")
+        self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
+        self.assertNotIn("status", merged[0])
+        self.assertNotIn("verification_status", merged[0])
 
-    def test_uncertain_verification_status_updates_active_lifecycle_to_unknown(self) -> None:
+    def test_uncertain_verification_status_does_not_persist_status(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
         existing = [
             {
@@ -335,8 +418,9 @@ print("not json")
             now,
         )
 
-        self.assertEqual(merged[0]["status"], "unknown")
-        self.assertEqual(merged[0]["verification_status"], "access_blocked")
+        self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
+        self.assertNotIn("status", merged[0])
+        self.assertNotIn("verification_status", merged[0])
 
     def test_merge_company_patch_preserves_existing_research_details(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
@@ -388,17 +472,17 @@ print("not json")
                 "interview_prep": ["Ask about platform scale"],
             }
         ]
-        placeholder_patch = workspace_tools._compact_state_patch(
-            {
-                "companies": [
+        placeholder_patch = {
+            "companies": [
+                workspace_tools._compact_company_for_state(
                     {
                         "name": "Acme GmbH",
                         "risks": "Unknown",
                         "interview_prep": "Unspecified",
                     }
-                ]
-            }
-        )
+                )
+            ]
+        }
 
         merged = workspace_tools._merge_companies(existing, placeholder_patch["companies"], now)
 
@@ -444,16 +528,40 @@ class JobSearchTaskTests(unittest.TestCase):
     def test_default_job_search_task_uses_config_profile(self) -> None:
         self.assertEqual(
             task_runner.resolve_task_config_path(),
-            PROJECT_ROOT / "src" / "configs" / "job_search.toml",
+            PROJECT_ROOT / "src" / "configs" / "job_search.py",
         )
 
         task = task_runner.load_job_search_task()
 
-        self.assertIn("target_roles: Backend Engineer", task)
-        self.assertIn("target_locations: Leipzig", task)
+        self.assertIn("target_roles: ", task)
+        self.assertIn("target_locations: München", task)
+        self.assertIn("candidate_skills: python, AI", task)
         self.assertIn("resume_pdf_path: ", task)
 
-    def test_load_job_search_task_from_toml(self) -> None:
+    def test_load_job_search_task_from_python(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "job_search.py"
+            config_path.write_text(
+                """
+job_search = {
+    "target_roles": ["Backend Engineer", "Platform Engineer"],
+    "target_locations": ["Leipzig"],
+    "remote_preference": "hybrid or remote",
+    "notes": "focus on Python\\nand Docker",
+}
+""".strip(),
+                encoding="utf-8",
+            )
+
+            task = task_runner.load_job_search_task(config_path)
+
+        self.assertIn("target_roles: Backend Engineer, Platform Engineer", task)
+        self.assertIn("target_locations: Leipzig", task)
+        self.assertIn("remote_preference: hybrid or remote", task)
+        self.assertIn("notes: focus on Python and Docker", task)
+        self.assertIn("resume_pdf_path: ", task)
+
+    def test_load_job_search_task_rejects_toml(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "job_search.toml"
             config_path.write_text(
@@ -467,19 +575,14 @@ notes = "focus on Python\\nand Docker"
                 encoding="utf-8",
             )
 
-            task = task_runner.load_job_search_task(config_path)
-
-        self.assertIn("target_roles: Backend Engineer, Platform Engineer", task)
-        self.assertIn("target_locations: Leipzig", task)
-        self.assertIn("remote_preference: hybrid or remote", task)
-        self.assertIn("notes: focus on Python and Docker", task)
-        self.assertIn("resume_pdf_path: ", task)
+            with self.assertRaises(ValueError):
+                task_runner.load_job_search_task(config_path)
 
     def test_resolve_task_config_path_prefers_env_var(self) -> None:
-        with patch.dict(os.environ, {task_runner.TASK_CONFIG_ENV_VAR: "src/configs/custom.toml"}):
+        with patch.dict(os.environ, {task_runner.TASK_CONFIG_ENV_VAR: "src/configs/custom.py"}):
             self.assertEqual(
                 task_runner.resolve_task_config_path(),
-                (PROJECT_ROOT / "src" / "configs" / "custom.toml").resolve(),
+                (PROJECT_ROOT / "src" / "configs" / "custom.py").resolve(),
             )
 
 

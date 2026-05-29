@@ -74,8 +74,13 @@ Rules:
 - Use at least 6 distinct search queries unless the intake brief is too narrow to justify them; record every query used.
 - Use the provided search_date/current_date/run_date or intake Search date for the Search date field.
 - Search role synonyms, seniority variants, location variants, company career pages, ATS pages, job boards, and aggregators.
+- If a previous job dedupe brief is provided, treat its canonical URLs and dedupe keys as already-seen jobs.
+- Avoid returning already-seen jobs in Ranked Job Results unless there are not enough relevant new jobs; list unavoidable repeats under Excluded Or Duplicate Results when practical.
 - Discover up to {CONFIG.search.max_discovered_jobs} real candidate jobs before dedupe.
 - Return the top {CONFIG.search.max_detailed_jobs} deduplicated jobs as detailed ranked results.
+- At most 5 of the top {CONFIG.search.max_detailed_jobs} detailed results may be enterprise/direct jobs from large, well-known company career pages or their direct ATS postings.
+- Put additional relevant enterprise/direct jobs beyond that cap in Backlog Jobs instead of Ranked Job Results.
+- Use the remaining detailed result slots for relevant local startups, SMEs, local job boards, niche boards, and lesser-known companies in or near the target locations whenever available.
 - Put remaining useful deduplicated jobs in Backlog Jobs.
 - Preserve source URLs.
 - Do not invent job postings or fields.

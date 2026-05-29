@@ -53,37 +53,39 @@ inside a Docker container, and the local `workspace/` directory is mounted at
 
 ## Configure Search
 
-The default scheduled search profile lives in `src/configs/job_search.toml`:
+The default scheduled search profile lives in `src/configs/job_search.py`:
 
-```toml
-[job_search]
-resume_pdf_path = ""
-target_roles = []
-target_locations = []
-remote_preference = ""
-industries = []
-company_preferences = []
-salary_expectation = ""
-start_date_or_timeline = ""
-work_authorization_or_visa = ""
-must_have_constraints = []
-nice_to_have = []
-excluded_roles_or_companies = []
-notes = ""
+```python
+job_search = {
+    "resume_pdf_path": "",
+    "target_roles": [],
+    "target_locations": [],
+    "candidate_skills": [],
+    "remote_preference": "",
+    "industries": [],
+    "company_preferences": [],
+    "salary_expectation": "",
+    "start_date_or_timeline": "",
+    "work_authorization_or_visa": "",
+    "must_have_constraints": [],
+    "nice_to_have": [],
+    "excluded_roles_or_companies": [],
+    "notes": "",
+}
 ```
 
 Use `resume_pdf_path` only when you want resume-based analysis. Put PDFs under
 `workspace/` and reference them with a workspace path such as
 `workspace/resumes/resume.pdf` or `/workspace/resumes/resume.pdf`; the document
 tool rejects paths outside the workspace. Partial custom profiles are supported:
-values from a custom TOML file are merged over the default profile.
+values from a custom Python file are merged over the default profile.
 
-Run with a different profile by creating another TOML file, then passing
+Run with a different profile by creating another Python file, then passing
 `--task-config` or setting `JOB_FINDER_TASK_CONFIG`:
 
 ```bash
-cp src/configs/job_search.toml src/configs/my_job_search.toml
-uv run job-finder-run --task-config src/configs/my_job_search.toml
+cp src/configs/job_search.py src/configs/my_job_search.py
+uv run job-finder-run --task-config src/configs/my_job_search.py
 ```
 
 ## Run Locally
@@ -93,6 +95,9 @@ Run the full pipeline once:
 ```bash
 uv run job-finder-run
 ```
+
+A full run usually takes about one hour, depending on model latency, page
+verification, and company research.
 
 Run without the overlap-prevention lock:
 
@@ -149,6 +154,10 @@ workspace/latest/
   job_search_state.json
 ```
 
+`job_search_state.json` is a compact dedupe index only. It stores previous job
+titles, companies, locations, URLs, and dedupe keys so later searches can avoid
+repeating the same postings.
+
 Each run also gets a snapshot under:
 
 ```text
@@ -175,7 +184,7 @@ variables use the `JOB_FINDER_` prefix.
 | `JOB_FINDER_MODEL_NAME` | `gpt-5.5` | Model name passed to the selected provider. |
 | `JOB_FINDER_REASONING_EFFORT` | `xhigh` | Reasoning effort passed to providers that support it. |
 | `JOB_FINDER_CODEX_AUTH_PATH` | `.codex_oauth/auth/codex.json` | Credential file used only by the default `codex_oauth` provider. |
-| `JOB_FINDER_TASK_CONFIG` | `src/configs/job_search.toml` | TOML profile for scheduled runs. |
+| `JOB_FINDER_TASK_CONFIG` | `src/configs/job_search.py` | Python profile for scheduled runs. |
 | `JOB_FINDER_WORKSPACE_DIR` | `workspace` | Root directory for artifacts, snapshots, caches, and locks. |
 | `JOB_FINDER_LOG_DIR` | `runs/logs` | Runtime log directory. |
 | `JOB_FINDER_DOCKER_IMAGE` | `python:3.12-slim` | Docker image used for agent shell execution. |
@@ -190,9 +199,12 @@ variables use the `JOB_FINDER_` prefix.
 
 ## Scheduled Runs With cron
 
-`job-finder-run` is cron-friendly. It loads the TOML task config, runs the agent
+`job-finder-run` is cron-friendly. It loads the Python task config, runs the agent
 once, and uses `workspace/job_finder.lock` to skip overlapping runs when a
 previous search is still active.
+
+Schedule with enough room for each run to finish; a typical search takes about
+one hour.
 
 Example crontab entry for weekdays at 09:00:
 
@@ -210,7 +222,7 @@ command -v uv
 To use a custom profile:
 
 ```cron
-0 9 * * 1-5 cd /path/to/job_finder && mkdir -p runs/logs && /opt/homebrew/bin/uv run job-finder-run --task-config src/configs/job_search.toml >> runs/logs/cron.log 2>&1
+0 9 * * 1-5 cd /path/to/job_finder && mkdir -p runs/logs && /opt/homebrew/bin/uv run job-finder-run --task-config src/configs/job_search.py >> runs/logs/cron.log 2>&1
 ```
 
 ## Development
@@ -252,4 +264,4 @@ job_finder/
 - Scheduled run skipped: check whether `workspace/job_finder.lock` exists
   because another run is active.
 - Sparse match scores: provide a `resume_pdf_path` or more candidate details in
-  the TOML profile.
+  the Python profile.

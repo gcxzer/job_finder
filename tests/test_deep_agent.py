@@ -25,5 +25,13 @@ class LazyDeepAgentTests(unittest.TestCase):
         self.assertEqual(result, ("invoke", ("payload",), {"config": {"thread_id": "test"}}))
 
 
+class MainAgentPromptTests(unittest.TestCase):
+    def test_main_agent_reads_dedupe_state_before_search(self) -> None:
+        self.assertIn("Call read_job_search_dedupe_state", deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("Include the dedupe_brief", deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("workspace job dedupe index", deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertNotIn("Company State JSON from the output.\n   - Call update_job_search_state", deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()

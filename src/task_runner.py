@@ -6,7 +6,7 @@ import fcntl
 import json
 import os
 import re
-import tomllib
+import runpy
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
@@ -25,8 +25,13 @@ MAX_LOG_TEXT_CHARS = 1200
 MAX_LOG_ITEMS = 10
 MAX_LOG_DEPTH = 3
 DEFAULT_LOCK_PATH = CONFIG.workspace.root_dir / "job_finder.lock"
-DEFAULT_TASK_CONFIG_PATH = PROJECT_ROOT / "src" / "configs" / "job_search.toml"
+DEFAULT_TASK_CONFIG_PATH = PROJECT_ROOT / "src" / "configs" / "job_search.py"
 EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+agent_config = {
+    "recursion_limit": 90,
+    "configurable": {"thread_id": "job_finder_orchestrator"},
+}
+logger = setup_logger()
 
 class LockAlreadyHeld(RuntimeError):
     """Raised when another scheduled job_finder run is already active."""
@@ -37,7 +42,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     try:
         task = load_job_search_task(args.task_config)
-    except (FileNotFoundError, ValueError, tomllib.TOMLDecodeError) as exc:
+    except (FileNotFoundError, ValueError, SyntaxError) as exc:
         raise SystemExit(f"Failed to load job search task config: {exc}") from exc
 
     if args.no_lock:
@@ -57,7 +62,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--task-config",
         default=None,
         help=(
-            f"Path to a TOML job search config. Defaults to {DEFAULT_TASK_CONFIG_PATH}. "
+            f"Path to a Python job search config. Defaults to {DEFAULT_TASK_CONFIG_PATH}. "
             f"Can also be set with {TASK_CONFIG_ENV_VAR}."
         ),
     )
@@ -112,14 +117,17 @@ def _load_job_search_config(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Job search task config does not exist: {path}")
 
-    with path.open("rb") as config_file:
-        data = tomllib.load(config_file)
+    if path.suffix != ".py":
+        raise ValueError(f"Job search task config must be a Python file: {path}")
+    return _load_python_job_search_config(path)
 
-    values = data.get("job_search", data)
+
+def _load_python_job_search_config(path: Path) -> dict[str, Any]:
+    data = runpy.run_path(str(path))
+    values = data.get("job_search", data.get("JOB_SEARCH"))
     if not isinstance(values, Mapping):
-        raise ValueError(f"Job search task config must contain a table: {path}")
+        raise ValueError(f"Python job search config must define a job_search mapping: {path}")
     return dict(values)
-
 
 def _format_task_value(value: Any) -> str:
     if value is None:
@@ -302,11 +310,3 @@ def _redact_phone_numbers(text: str) -> str:
         cursor = end
     chunks.append(text[cursor:])
     return "".join(chunks)
-
-
-agent_config = {
-    "recursion_limit": 80,
-    "configurable": {"thread_id": "job_finder_orchestrator"},
-}
-logger = setup_logger()
-
