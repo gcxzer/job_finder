@@ -25,6 +25,12 @@ ARTIFACT_FILES = {
     "05_company_research.md",
     "06_final_job_search_report.md",
 }
+FINAL_REPORT_FILE_NAME = "06_final_job_search_report.md"
+FINAL_REPORT_URL_SOURCE_SECTIONS = (
+    ("03_verified_job_results.md", "Verified Job State JSON"),
+    ("02_raw_job_results.md", "Job State JSON"),
+    ("04_resume_match_report.md", "Match State JSON"),
+)
 RUN_ID_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}(?:_\d+)?\Z")
 
 MAX_STATE_SOURCE_URLS = 8
@@ -44,6 +50,35 @@ PLACEHOLDER_TEXT_VALUES = {
     "unknown",
     "unavailable",
     "unspecified",
+}
+REPORT_URL_PLACEHOLDER_VALUES = {
+    "url not supplied",
+}
+REPORT_MATCH_STOPWORDS = {
+    "a",
+    "ag",
+    "an",
+    "and",
+    "at",
+    "co",
+    "company",
+    "deutschland",
+    "d",
+    "exact",
+    "f",
+    "germany",
+    "gmbh",
+    "in",
+    "kg",
+    "ltd",
+    "m",
+    "not",
+    "role",
+    "supplied",
+    "the",
+    "title",
+    "w",
+    "x",
 }
 VERIFICATION_STATUSES_THAT_PROVE_ACTIVE = {"verified"}
 VERIFICATION_STATUSES_THAT_PROVE_CLOSED = {"closed"}
@@ -129,6 +164,8 @@ def save_job_artifact(run_id: str, file_name: str, content: str) -> dict[str, An
 
     latest_path = LATEST_DIR / file_name
     run_path = run_dir / file_name
+    if file_name == FINAL_REPORT_FILE_NAME:
+        content = _repair_final_report_urls(content, run_dir)
 
     latest_path.parent.mkdir(parents=True, exist_ok=True)
     run_path.parent.mkdir(parents=True, exist_ok=True)
@@ -429,6 +466,278 @@ def _loads_jsonish_from_markdown_section(markdown: str, heading: str = "") -> An
         else markdown[section_start:]
     )
     return _loads_jsonish(section)
+
+
+def _repair_final_report_urls(content: str, run_dir: Path) -> str:
+    records = _load_report_url_records(run_dir)
+    if not records or "URL not supplied" not in content:
+        return content
+
+    repaired_lines: list[str] = []
+    header_cells: list[str] = []
+    header_indexes: dict[str, int] = {}
+
+    for line in content.splitlines(keepends=True):
+        line_body = line.removesuffix("\n")
+        newline = "\n" if line.endswith("\n") else ""
+        cells = _split_markdown_table_row(line_body)
+        if not cells:
+            header_cells = []
+            header_indexes = {}
+            repaired_lines.append(line)
+            continue
+
+        if "url" in {_normalize_table_header(cell) for cell in cells}:
+            header_cells = cells
+            header_indexes = {
+                _normalize_table_header(cell): index
+                for index, cell in enumerate(header_cells)
+            }
+            repaired_lines.append(line)
+            continue
+
+        if _is_markdown_table_separator(cells):
+            repaired_lines.append(line)
+            continue
+
+        url_index = header_indexes.get("url")
+        if url_index is None or url_index >= len(cells):
+            repaired_lines.append(line)
+            continue
+
+        if _normalize_report_url_placeholder(cells[url_index]) not in REPORT_URL_PLACEHOLDER_VALUES:
+            repaired_lines.append(line)
+            continue
+
+        role = _cell_by_header(cells, header_indexes, "role")
+        company = _cell_by_header(cells, header_indexes, "company")
+        status = _cell_by_header(cells, header_indexes, "verification status")
+        match = _best_report_url_record(records, role=role, company=company, status=status)
+        if match is None:
+            repaired_lines.append(line)
+            continue
+
+        cells[url_index] = _markdown_link("Job page", match["url"])
+        repaired_lines.append(_join_markdown_table_row(cells) + newline)
+
+    return "".join(repaired_lines)
+
+
+def _load_report_url_records(run_dir: Path) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for source_index, (file_name, heading) in enumerate(FINAL_REPORT_URL_SOURCE_SECTIONS):
+        path = run_dir / file_name
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        try:
+            patch = _loads_jsonish_from_markdown_section(text, heading)
+        except ValueError:
+            patch = None
+        if isinstance(patch, dict):
+            jobs = patch.get("jobs")
+            if isinstance(jobs, list):
+                for job_index, job in enumerate(jobs):
+                    if not isinstance(job, dict):
+                        continue
+                    url = _preferred_report_job_url(job)
+                    if not url:
+                        continue
+                    records.append(
+                        {
+                            "title": str(job.get("title") or ""),
+                            "company": str(job.get("company") or ""),
+                            "status": str(job.get("verification_status") or ""),
+                            "url": url,
+                            "source_index": str(source_index),
+                            "job_index": str(job_index),
+                        }
+                    )
+        records.extend(_load_markdown_report_url_records(text, source_index=source_index))
+    return records
+
+
+def _load_markdown_report_url_records(text: str, *, source_index: int) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for line_index, line in enumerate(text.splitlines()):
+        match = re.search(r"^\s*[-*]\s+Job:\s*(?P<before>.*?)\s*(?P<url>https?://\S+)", line)
+        if match is None:
+            continue
+        url = _clean_report_url(match.group("url").rstrip(".,;"))
+        if not url:
+            continue
+        parts = [
+            part.strip()
+            for part in re.split(r"\s+—\s+", match.group("before").strip())
+            if part.strip()
+        ]
+        status_match = re.search(r"verification_status:\s*([a-zA-Z_]+)", line)
+        records.append(
+            {
+                "title": parts[0] if parts else "",
+                "company": parts[1] if len(parts) > 1 else "",
+                "status": status_match.group(1) if status_match else "",
+                "url": url,
+                "source_index": str(source_index),
+                "job_index": str(line_index),
+            }
+        )
+    return records
+
+
+def _preferred_report_job_url(job: dict[str, Any]) -> str:
+    for field_name in ("apply_url", "final_url", "canonical_url", "url"):
+        url = _clean_report_url(job.get(field_name))
+        if url:
+            return url
+
+    source_urls = job.get("source_urls")
+    if isinstance(source_urls, str):
+        return _clean_report_url(source_urls)
+    if isinstance(source_urls, list):
+        for item in source_urls:
+            url = _clean_report_url(item)
+            if url:
+                return url
+    return ""
+
+
+def _clean_report_url(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or _is_placeholder_text(text):
+        return ""
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return text
+
+
+def _markdown_link(label: str, url: str) -> str:
+    return f"[{label}]({url})"
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    if not line.lstrip().startswith("|"):
+        return []
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", text)]
+
+
+def _join_markdown_table_row(cells: list[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+def _is_markdown_table_separator(cells: list[str]) -> bool:
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def _normalize_table_header(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower())
+
+
+def _normalize_report_url_placeholder(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().lower().rstrip("."))
+
+
+def _cell_by_header(cells: list[str], header_indexes: dict[str, int], header: str) -> str:
+    index = header_indexes.get(header)
+    if index is None or index >= len(cells):
+        return ""
+    return cells[index]
+
+
+def _best_report_url_record(
+    records: list[dict[str, str]],
+    *,
+    role: str,
+    company: str,
+    status: str,
+) -> dict[str, str] | None:
+    best_record: dict[str, str] | None = None
+    best_score = 0.0
+    for record in records:
+        score = _report_url_match_score(record, role=role, company=company, status=status)
+        if score > best_score:
+            best_record = record
+            best_score = score
+
+    return best_record if best_score >= 0.65 else None
+
+
+def _report_url_match_score(
+    record: dict[str, str],
+    *,
+    role: str,
+    company: str,
+    status: str,
+) -> float:
+    role_score = _token_similarity(role, record.get("title", ""))
+    company_score = _token_similarity(company, record.get("company", ""))
+    company_is_placeholder = _is_placeholder_text(company)
+    if company_is_placeholder:
+        score = _token_jaccard(role, record.get("title", ""))
+    else:
+        score = (role_score * 0.65) + (company_score * 0.35)
+
+    row_status = _normalize_report_status(status)
+    record_status = _normalize_report_status(record.get("status", ""))
+    if row_status and record_status and row_status == record_status:
+        score += 0.12
+
+    source_index = int(record.get("source_index") or 0)
+    job_index = int(record.get("job_index") or 0)
+    return score - (source_index * 0.001) - (job_index * 0.00001)
+
+
+def _token_similarity(left: str, right: str) -> float:
+    left_tokens = _match_tokens(left)
+    right_tokens = _match_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = left_tokens & right_tokens
+    if not overlap:
+        return 0.0
+    containment = len(overlap) / min(len(left_tokens), len(right_tokens))
+    jaccard = len(overlap) / len(left_tokens | right_tokens)
+    return max(containment, jaccard)
+
+
+def _token_jaccard(left: str, right: str) -> float:
+    left_tokens = _match_tokens(left)
+    right_tokens = _match_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = left_tokens & right_tokens
+    if not overlap:
+        return 0.0
+    return len(overlap) / len(left_tokens | right_tokens)
+
+
+def _match_tokens(value: str) -> set[str]:
+    slug = _slug(value)
+    if not slug:
+        return set()
+    return {
+        token
+        for token in slug.split("_")
+        if len(token) > 1 and token not in REPORT_MATCH_STOPWORDS
+    }
+
+
+def _normalize_report_status(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    if text.startswith("verified"):
+        return "verified"
+    if text in VERIFICATION_STATUSES_WITH_UNKNOWN_LIFECYCLE | VERIFICATION_STATUSES_THAT_PROVE_CLOSED:
+        return text
+    return text
 
 
 def _merge_dict(base: Any, patch: dict[str, Any]) -> dict[str, Any]:

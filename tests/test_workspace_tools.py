@@ -188,6 +188,91 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("was not found", result["error"])
 
+    def test_save_final_report_repairs_missing_url_cells_from_source_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            latest_dir = root / "latest"
+            runs_dir = root / "runs"
+            run_id = "2026-05-29_120000"
+            run_dir = runs_dir / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / "03_verified_job_results.md").write_text(
+                """
+## Verified Job State JSON
+```json
+{"jobs": [
+  {"title": "AI Developer (m/w/d) - Munich", "company": "Optimus Search", "verification_status": "unverified", "canonical_url": "https://jobs.example/optimus-ai-developer"},
+  {"title": "Data Scientist (m/f/d) - remote", "company": "Unspecified", "verification_status": "closed", "canonical_url": "https://jobs.example/data-scientist-remote"},
+  {"title": "Data Scientist (m|f|d)", "company": "MEAG", "verification_status": "closed", "canonical_url": "https://jobs.example/meag-data-scientist"},
+  {"title": "AI Engineer", "company": "Knowunity GmbH", "verification_status": "access_blocked", "final_url": "https://jobs.example/knowunity-ai-engineer"}
+]}
+```
+""".strip(),
+                encoding="utf-8",
+            )
+            (run_dir / "02_raw_job_results.md").write_text(
+                """
+## Backlog Jobs
+- Job: Senior C++ QT/ML Engineer — Infosys Ltd. / in-tech — München hybrid — https://jobs.example/senior-qt-ml-engineer — ML engineering signal.
+- Job: Working Student in (Gen)AI Transformation Management (m|f|d) — MEAG — München — https://jobs.example/meag-working-student — student role.
+
+## Job State JSON
+```json
+{"jobs": [
+  {"title": "AWS AI & Data Engineer (m/w/d)", "company": "Reply / Storm Reply", "canonical_url": "https://jobs.example/aws-ai-data-engineer"}
+]}
+```
+""".strip(),
+                encoding="utf-8",
+            )
+            final_report = """
+## Good But Unverified
+
+| Role | Company | Verification status | Recommendation | URL |
+| --- | --- | --- | --- | --- |
+| AI Developer | Optimus Search | unverified | Unspecified | URL not supplied |
+
+## Backlog To Verify Later
+
+| Role | Company | Verification status | Recommendation | URL |
+| --- | --- | --- | --- | --- |
+| AWS AI & Data Engineer | Reply | not_verified_backlog | Unspecified | URL not supplied |
+| Senior QT/ML Engineer | Infosys / in-tech | not_verified_backlog | Unspecified | URL not supplied |
+| MEAG working student role, exact title not supplied | MEAG | not_verified_backlog | Unspecified | URL not supplied |
+
+## Closed Or Access-Limited
+
+| Role | Company | Verification status | Recommendation | URL | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Data Scientist, remote listing with company not supplied | Unspecified | closed | Skip | URL not supplied | Posting appeared unavailable. |
+| AI Engineer | Knowunity | access_blocked | Unspecified | URL not supplied | Crawler could not read the page. |
+""".strip()
+
+            with (
+                patch.object(workspace_tools, "LATEST_DIR", latest_dir),
+                patch.object(workspace_tools, "RUNS_DIR", runs_dir),
+            ):
+                result = workspace_tools.save_job_artifact.invoke(
+                    {
+                        "run_id": run_id,
+                        "file_name": "06_final_job_search_report.md",
+                        "content": final_report,
+                    }
+                )
+                saved_report = (latest_dir / "06_final_job_search_report.md").read_text(encoding="utf-8")
+                run_report = (run_dir / "06_final_job_search_report.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(saved_report, run_report)
+        self.assertNotIn("URL not supplied", saved_report)
+        self.assertIn("[Job page](https://jobs.example/optimus-ai-developer)", saved_report)
+        self.assertIn("[Job page](https://jobs.example/aws-ai-data-engineer)", saved_report)
+        self.assertIn("[Job page](https://jobs.example/senior-qt-ml-engineer)", saved_report)
+        self.assertIn("[Job page](https://jobs.example/meag-working-student)", saved_report)
+        self.assertIn("[Job page](https://jobs.example/data-scientist-remote)", saved_report)
+        self.assertNotIn("[Job page](https://jobs.example/meag-data-scientist)", saved_report)
+        self.assertIn("[Job page](https://jobs.example/knowunity-ai-engineer)", saved_report)
+
     def test_read_job_search_dedupe_state_returns_compact_brief(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             latest_dir = Path(temp_dir) / "latest"
