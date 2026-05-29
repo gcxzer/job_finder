@@ -167,7 +167,7 @@ Rules:
 - Do not require any field as mandatory.
 - Do not ask follow-up questions by default.
 - Preserve any user-provided search_date, current_date, or run_date as Search date.
-- In Blocking Questions, write "None." unless the user explicitly asks what information is missing.
+- In Blocking Questions, write exactly "- None." unless the user explicitly asks what information is missing.
 - If the user asks what information is missing, list only the most useful optional questions in Blocking Questions.
 - Keep the brief concise and useful for downstream job-search work."""
 

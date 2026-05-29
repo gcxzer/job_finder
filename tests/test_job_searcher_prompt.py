@@ -15,6 +15,9 @@ class JobSearcherPromptTests(unittest.TestCase):
         self.assertIn("companies in or near the target locations", JOB_SEARCHER_SYSTEM_PROMPT)
         self.assertIn("previous job dedupe brief", JOB_SEARCHER_SYSTEM_PROMPT)
         self.assertIn("already-seen jobs", JOB_SEARCHER_SYSTEM_PROMPT)
+        self.assertIn("active or unknown-status", JOB_SEARCHER_SYSTEM_PROMPT)
+        self.assertIn("status=closed", JOB_SEARCHER_SYSTEM_PROMPT)
+        self.assertIn("lowercase ASCII, accent folding", JOB_SEARCHER_SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

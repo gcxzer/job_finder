@@ -74,7 +74,8 @@ Rules:
 - Use at least 6 distinct search queries unless the intake brief is too narrow to justify them; record every query used.
 - Use the provided search_date/current_date/run_date or intake Search date for the Search date field.
 - Search role synonyms, seniority variants, location variants, company career pages, ATS pages, job boards, and aggregators.
-- If a previous job dedupe brief is provided, treat its canonical URLs and dedupe keys as already-seen jobs.
+- If a previous job dedupe brief is provided, treat active or unknown-status canonical URLs and dedupe keys as already-seen jobs.
+- Previous records with status=closed are historical. Do not exclude a current open posting solely because a closed record has the same company/title/location; preserve the current source URL and evidence when search results indicate the posting is active.
 - Avoid returning already-seen jobs in Ranked Job Results unless there are not enough relevant new jobs; list unavoidable repeats under Excluded Or Duplicate Results when practical.
 - Discover up to {CONFIG.search.max_discovered_jobs} real candidate jobs before dedupe.
 - Return the top {CONFIG.search.max_detailed_jobs} deduplicated jobs as detailed ranked results.
@@ -96,7 +97,7 @@ Rules:
 - Use confidence values: High, Medium, or Low.
 - Use source_type values only: company_career_page, ats, job_board, aggregator.
 - The Job State JSON must be valid JSON and include one compact object per deduplicated job with: discovery_rank, title, company, location, remote_status, salary, canonical_url, source_urls, source_type, query_used, posted_date, discovery_status, requirements, confidence, dedupe_key.
-- dedupe_key must be normalized_company + "|" + normalized_title + "|" + normalized_location.
+- dedupe_key must be normalized_company + "|" + normalized_title + "|" + normalized_location, using lowercase ASCII, accent folding, and underscores for non-alphanumeric runs.
 - Use discovery_status exactly as "found" for discovered jobs.
 - Do not include full job descriptions in Job State JSON. Keep long text only in the Markdown job result sections.
 - Do not include comments or Markdown inside the JSON code block.

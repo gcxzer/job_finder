@@ -111,11 +111,82 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertEqual(list(state), ["jobs"])
         self.assertEqual(
             set(state["jobs"][0]),
-            {"title", "company", "location", "canonical_url", "source_urls", "dedupe_key"},
+            {
+                "title",
+                "company",
+                "location",
+                "canonical_url",
+                "source_urls",
+                "dedupe_key",
+                "first_seen_at",
+                "last_seen_at",
+            },
         )
         self.assertNotIn("requirements", state["jobs"][0])
         self.assertNotIn("match_score", state["jobs"][0])
         self.assertNotIn("recommendation", state["jobs"][0])
+
+    def test_update_job_search_state_from_artifact_extracts_named_json_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            latest_dir = root / "latest"
+            runs_dir = root / "runs"
+            run_id = "2026-05-29_120000"
+            run_dir = runs_dir / run_id
+            run_dir.mkdir(parents=True)
+            artifact = run_dir / "02_raw_job_results.md"
+            artifact.write_text(
+                """
+## Search Strategy
+```json
+{"not_state": true}
+```
+
+## Job State JSON
+```json
+{"jobs": [{"title": "Backend Engineer", "company": "Acme", "location": "Leipzig", "canonical_url": "https://acme.example/jobs/1"}]}
+```
+""".strip(),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(workspace_tools, "LATEST_DIR", latest_dir),
+                patch.object(workspace_tools, "RUNS_DIR", runs_dir),
+            ):
+                result = workspace_tools.update_job_search_state_from_artifact.invoke(
+                    {
+                        "run_id": run_id,
+                        "file_name": "02_raw_job_results.md",
+                        "state_section_heading": "Job State JSON",
+                    }
+                )
+                state = json.loads((latest_dir / "job_search_state.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["merged_job_count"], 1)
+        self.assertEqual(state["jobs"][0]["canonical_url"], "https://acme.example/jobs/1")
+
+    def test_update_job_search_state_from_artifact_requires_named_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runs_dir = root / "runs"
+            run_id = "2026-05-29_120000"
+            run_dir = runs_dir / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / "02_raw_job_results.md").write_text("## Other\n{}", encoding="utf-8")
+
+            with patch.object(workspace_tools, "RUNS_DIR", runs_dir):
+                result = workspace_tools.update_job_search_state_from_artifact.invoke(
+                    {
+                        "run_id": run_id,
+                        "file_name": "02_raw_job_results.md",
+                        "state_section_heading": "Job State JSON",
+                    }
+                )
+
+        self.assertFalse(result["success"])
+        self.assertIn("was not found", result["error"])
 
     def test_read_job_search_dedupe_state_returns_compact_brief(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -145,10 +216,12 @@ class WorkspaceToolsTests(unittest.TestCase):
         self.assertTrue(result["success"], result)
         self.assertEqual(result["job_count"], 1)
         self.assertEqual(result["returned_job_count"], 1)
-        self.assertIn("acme|backend engineer|leipzig", result["dedupe_brief"])
+        self.assertIn("acme|backend_engineer|leipzig", result["dedupe_brief"])
+        self.assertIn("status=active_or_previous", result["dedupe_brief"])
+        self.assertIn("last_seen=", result["dedupe_brief"])
         self.assertEqual(result["jobs"][0]["canonical_url"], "https://acme.example/jobs/1")
 
-    def test_read_job_search_dedupe_state_returns_last_inserted_jobs(self) -> None:
+    def test_read_job_search_dedupe_state_prioritizes_current_recent_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             latest_dir = Path(temp_dir) / "latest"
             latest_dir.mkdir(parents=True)
@@ -157,22 +230,49 @@ class WorkspaceToolsTests(unittest.TestCase):
                     {
                         "jobs": [
                             {
-                                "title": f"Job {index}",
+                                "title": "Active stale",
                                 "company": "Acme",
                                 "location": "Leipzig",
-                                "canonical_url": f"https://acme.example/jobs/{index}",
-                            }
-                            for index in range(1, 5)
-                        ]
+                                "canonical_url": "https://acme.example/jobs/active-stale",
+                                "last_seen_at": "2026-05-10",
+                            },
+                            {
+                                "title": "Closed newest",
+                                "company": "Acme",
+                                "location": "Leipzig",
+                                "canonical_url": "https://acme.example/jobs/closed-newest",
+                                "status": "closed",
+                                "last_seen_at": "2026-05-30",
+                            },
+                            {
+                                "title": "Unknown recent",
+                                "company": "Acme",
+                                "location": "Leipzig",
+                                "canonical_url": "https://acme.example/jobs/unknown-recent",
+                                "status": "unknown",
+                                "last_seen_at": "2026-05-28",
+                            },
+                            {
+                                "title": "Active recent",
+                                "company": "Acme",
+                                "location": "Leipzig",
+                                "canonical_url": "https://acme.example/jobs/active-recent",
+                                "last_seen_at": "2026-05-29",
+                            },
+                        ],
                     }
                 ),
                 encoding="utf-8",
             )
 
             with patch.object(workspace_tools, "LATEST_DIR", latest_dir):
-                result = workspace_tools.read_job_search_dedupe_state.invoke({"limit": 2})
+                result = workspace_tools.read_job_search_dedupe_state.invoke({"limit": 3})
 
-        self.assertEqual([job["title"] for job in result["jobs"]], ["Job 3", "Job 4"])
+        self.assertEqual(
+            [job["title"] for job in result["jobs"]],
+            ["Active recent", "Unknown recent", "Active stale"],
+        )
+        self.assertNotIn("Closed newest", result["dedupe_brief"])
 
     def test_loads_jsonish_prefers_explicit_json_fenced_block(self) -> None:
         payload = """
@@ -223,6 +323,78 @@ print("not json")
         self.assertNotIn("match_score", merged[0])
         self.assertNotIn("recommendation", merged[0])
 
+    def test_url_normalization_merges_tracking_variants(self) -> None:
+        now = "2026-05-28T00:00:00+02:00"
+        jobs = [
+            {
+                "title": "Senior Backend Engineer",
+                "company": "Acme GmbH",
+                "location": "München",
+                "canonical_url": "https://EXAMPLE.com/jobs/1?utm_source=linkedin#apply",
+            },
+            {
+                "title": "Backend Engineer",
+                "company": "Acme",
+                "location": "Munich",
+                "canonical_url": "https://example.com/jobs/1",
+            },
+        ]
+
+        merged = workspace_tools._merge_jobs([], jobs, now)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["canonical_url"], "https://example.com/jobs/1")
+        self.assertEqual(merged[0]["source_urls"], ["https://example.com/jobs/1"])
+
+    def test_dedupe_key_is_normalized_from_job_fields(self) -> None:
+        now = "2026-05-28T00:00:00+02:00"
+        jobs = [
+            {
+                "title": "Backend Engineer",
+                "company": "Acme",
+                "location": "München",
+                "canonical_url": "https://acme.example/jobs/1",
+                "dedupe_key": "Acme | Backend Engineer | München",
+            },
+            {
+                "title": "Backend Engineer",
+                "company": "Acme",
+                "location": "München",
+                "canonical_url": "https://acme.example/jobs/2",
+            },
+        ]
+
+        merged = workspace_tools._merge_jobs([], jobs, now)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["dedupe_key"], "acme|backend_engineer|munchen")
+
+    def test_missing_or_placeholder_location_does_not_merge_different_urls(self) -> None:
+        now = "2026-05-28T00:00:00+02:00"
+        jobs = [
+            {
+                "title": "Backend Engineer",
+                "company": "Acme",
+                "location": "Unspecified",
+                "canonical_url": "https://acme.example/jobs/berlin",
+            },
+            {
+                "title": "Backend Engineer",
+                "company": "Acme",
+                "location": "",
+                "canonical_url": "https://acme.example/jobs/munich",
+            },
+        ]
+
+        merged = workspace_tools._merge_jobs([], jobs, now)
+
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(
+            {job["canonical_url"] for job in merged},
+            {"https://acme.example/jobs/berlin", "https://acme.example/jobs/munich"},
+        )
+        self.assertTrue(all("dedupe_key" not in job for job in merged))
+
     def test_placeholder_list_values_do_not_replace_existing_job_details(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
         existing = [
@@ -254,7 +426,7 @@ print("not json")
         self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
         self.assertNotIn("requirements", merged[0])
 
-    def test_closed_verification_status_is_not_persisted_in_dedupe_state(self) -> None:
+    def test_closed_verification_status_persists_compact_lifecycle_status(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
 
         merged = workspace_tools._merge_jobs(
@@ -272,8 +444,38 @@ print("not json")
         )
 
         self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
-        self.assertNotIn("status", merged[0])
+        self.assertEqual(merged[0]["status"], "closed")
         self.assertNotIn("verification_status", merged[0])
+
+    def test_closed_status_does_not_stick_to_newly_discovered_url(self) -> None:
+        now = "2026-05-28T00:00:00+02:00"
+        existing = [
+            {
+                "title": "Backend Engineer",
+                "company": "Acme",
+                "location": "Leipzig",
+                "canonical_url": "https://acme.com/jobs/old-backend",
+                "status": "closed",
+            }
+        ]
+        newly_discovered = [
+            {
+                "title": "Backend Engineer",
+                "company": "Acme",
+                "location": "Leipzig",
+                "canonical_url": "https://acme.com/jobs/new-backend",
+            }
+        ]
+
+        merged = workspace_tools._merge_jobs(existing, newly_discovered, now)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/new-backend")
+        self.assertEqual(
+            merged[0]["source_urls"],
+            ["https://acme.com/jobs/old-backend", "https://acme.com/jobs/new-backend"],
+        )
+        self.assertNotIn("status", merged[0])
 
     def test_verified_patch_keeps_only_dedupe_fields(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
@@ -329,11 +531,11 @@ print("not json")
         merged = workspace_tools._merge_jobs(existing, match_patch, now)
 
         self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
-        self.assertNotIn("status", merged[0])
+        self.assertEqual(merged[0]["status"], "closed")
         self.assertNotIn("verification_status", merged[0])
         self.assertNotIn("match_score", merged[0])
 
-    def test_uncertain_verification_status_is_not_persisted(self) -> None:
+    def test_uncertain_verification_status_persists_unknown_lifecycle_status(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
         existing = [
             {
@@ -368,7 +570,7 @@ print("not json")
                 )
 
                 self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
-                self.assertNotIn("status", merged[0])
+                self.assertEqual(merged[0]["status"], "closed")
                 self.assertNotIn("verification_status", merged[0])
 
     def test_new_uncertain_verification_status_keeps_only_dedupe_fields(self) -> None:
@@ -389,10 +591,10 @@ print("not json")
         )
 
         self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
-        self.assertNotIn("status", merged[0])
+        self.assertEqual(merged[0]["status"], "unknown")
         self.assertNotIn("verification_status", merged[0])
 
-    def test_uncertain_verification_status_does_not_persist_status(self) -> None:
+    def test_uncertain_verification_status_marks_existing_active_as_unknown(self) -> None:
         now = "2026-05-28T00:00:00+02:00"
         existing = [
             {
@@ -419,7 +621,7 @@ print("not json")
         )
 
         self.assertEqual(merged[0]["canonical_url"], "https://acme.com/jobs/backend")
-        self.assertNotIn("status", merged[0])
+        self.assertEqual(merged[0]["status"], "unknown")
         self.assertNotIn("verification_status", merged[0])
 
     def test_merge_company_patch_preserves_existing_research_details(self) -> None:

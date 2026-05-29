@@ -22,6 +22,12 @@ CRAWLER_ROOT = CONFIG.workspace.crawlers_dir
 CONTAINER_WORKSPACE = CONFIG.docker.container_workspace_dir
 MAX_PREVIEW_CHARS = 1600
 CRAWLER_SCHEMA_VERSION = "job_extraction_context_v1"
+CRAWLER_SETUP_TIMEOUT_SECONDS = 120
+CRAWLER_DEPENDENCY_PACKAGES = {
+    "requests": "requests==2.34.2",
+    "bs4": "beautifulsoup4==4.14.3",
+    "lxml": "lxml==6.1.1",
+}
 CREDENTIAL_ENV_NAME_PATTERN = re.compile(
     r"(?:^|_)(?:api_?key|auth|bearer|cookie|credential|login|pass(?:word)?|secret|session|token|user(?:name)?)(?:_|$)",
     re.I,
@@ -335,15 +341,22 @@ def _load_html(*, html: str, html_file: str) -> str:
 
 
 def _crawler_dependency_setup_command() -> str:
+    packages_json = json.dumps(CRAWLER_DEPENDENCY_PACKAGES, sort_keys=True)
     return (
-        "python - <<'PY'\n"
+        f"timeout {CRAWLER_SETUP_TIMEOUT_SECONDS}s python - <<'PY'\n"
         "import importlib.util\n"
+        "import os\n"
         "import subprocess\n"
         "import sys\n"
-        "packages = {'requests': 'requests', 'bs4': 'beautifulsoup4', 'lxml': 'lxml'}\n"
+        f"packages = {packages_json}\n"
         "missing = [package for module, package in packages.items() if importlib.util.find_spec(module) is None]\n"
         "if missing:\n"
-        "    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', *missing])\n"
+        "    env = dict(os.environ)\n"
+        "    env.setdefault('PIP_DISABLE_PIP_VERSION_CHECK', '1')\n"
+        "    env.setdefault('PIP_NO_INPUT', '1')\n"
+        "    env.setdefault('PIP_DEFAULT_TIMEOUT', '30')\n"
+        "    print('installing crawler dependencies: ' + ', '.join(missing), flush=True)\n"
+        "    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', *missing], env=env)\n"
         "else:\n"
         "    print('crawler dependencies already installed')\n"
         "PY"
@@ -574,12 +587,14 @@ def _forbidden_import_roots(tree: ast.AST) -> set[str]:
 
 def _dangerous_call_names(tree: ast.AST) -> set[str]:
     calls: set[str] = set()
+    output_references = _output_file_references(tree)
+    path_constructors = _path_constructor_refs(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         if isinstance(func, ast.Name) and func.id in FORBIDDEN_BUILTIN_CALLS:
-            if func.id == "open" and _is_output_open_call(node, _output_file_references(tree)):
+            if func.id == "open" and _is_output_open_call(node, output_references, path_constructors):
                 continue
             calls.add(func.id)
         elif isinstance(func, ast.Attribute):
@@ -623,23 +638,28 @@ def _attribute_path(node: ast.AST) -> str:
 
 def _file_access_errors(tree: ast.AST) -> list[str]:
     references = _output_file_references(tree)
+    path_constructors = _path_constructor_refs(tree)
     errors: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         if isinstance(func, ast.Name) and func.id == "open":
-            if _is_output_open_call(node, references):
+            if _is_output_open_call(node, references, path_constructors):
                 continue
             errors.append("Must not open files other than OUTPUT_FILE.")
         elif isinstance(func, ast.Attribute):
             if func.attr == "open":
-                if _is_output_open_call(node, references):
+                if _is_output_open_call(node, references, path_constructors):
                     continue
                 errors.append("Must not open files other than OUTPUT_FILE.")
             if func.attr in {"read_bytes", "read_text"}:
                 errors.append("Must not read local files from generated crawler code.")
-            elif func.attr in {"touch", "unlink", "write_bytes", "write_text"} and not _references_output_value(func.value, references):
+            elif func.attr in {"touch", "unlink", "write_bytes", "write_text"} and not _is_exact_output_path_reference(
+                func.value,
+                references,
+                path_constructors,
+            ):
                 errors.append("Must write only to OUTPUT_FILE.")
     return _dedupe_errors(errors)
 
@@ -761,7 +781,8 @@ def _keyword_value(node: ast.Call, name: str) -> ast.AST | None:
 
 def _output_file_references(tree: ast.AST) -> set[str]:
     output_aliases = _env_value_aliases(tree, "OUTPUT_FILE")
-    return output_aliases | _path_aliases_from_output(tree, output_aliases)
+    path_constructors = _path_constructor_refs(tree)
+    return output_aliases | _path_aliases_from_output(tree, output_aliases, path_constructors)
 
 
 def _dedupe_errors(errors: list[str]) -> list[str]:
@@ -913,34 +934,47 @@ def _literal_string(node: ast.AST) -> str | None:
 
 def _writes_to_output_file(tree: ast.AST) -> bool:
     output_aliases = _env_value_aliases(tree, "OUTPUT_FILE")
-    path_aliases = _path_aliases_from_output(tree, output_aliases)
+    path_constructors = _path_constructor_refs(tree)
+    path_aliases = _path_aliases_from_output(tree, output_aliases, path_constructors)
     references = output_aliases | path_aliases
-    writer_aliases = _writer_aliases_for_output(tree, references)
+    writer_aliases = _writer_aliases_for_output(tree, references, path_constructors)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         if isinstance(func, ast.Attribute) and func.attr == "write_text":
-            if _references_output_value(func.value, references):
+            if _is_exact_output_path_reference(func.value, references, path_constructors):
                 return True
-        if _call_writes_to_output_handle(node, writer_aliases, references):
+        if _call_writes_to_output_handle(node, writer_aliases, references, path_constructors):
             return True
     return False
 
 
-def _writer_aliases_for_output(tree: ast.AST, references: set[str]) -> set[str]:
+def _writer_aliases_for_output(
+    tree: ast.AST,
+    references: set[str],
+    path_constructors: tuple[set[str], set[str]],
+) -> set[str]:
     aliases: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.With):
             for item in node.items:
-                if item.optional_vars is not None and _is_output_open_call(item.context_expr, references):
+                if item.optional_vars is not None and _is_output_open_call(
+                    item.context_expr,
+                    references,
+                    path_constructors,
+                ):
                     aliases.update(_assigned_names([item.optional_vars]))
         elif isinstance(node, ast.Assign):
-            if _is_output_open_call(node.value, references):
+            if _is_output_open_call(node.value, references, path_constructors):
                 aliases.update(_assigned_names(list(node.targets)))
         elif isinstance(node, ast.AnnAssign):
-            if node.value is not None and _is_output_open_call(node.value, references):
+            if node.value is not None and _is_output_open_call(
+                node.value,
+                references,
+                path_constructors,
+            ):
                 aliases.update(_assigned_names([node.target]))
     return aliases
 
@@ -949,12 +983,14 @@ def _call_writes_to_output_handle(
     node: ast.Call,
     writer_aliases: set[str],
     references: set[str],
+    path_constructors: tuple[set[str], set[str]],
 ) -> bool:
     func = node.func
     if isinstance(func, ast.Attribute) and func.attr in {"write", "writelines"}:
         return _references_writer_handle(func.value, writer_aliases) or _is_output_open_call(
             func.value,
             references,
+            path_constructors,
         )
     if isinstance(func, ast.Attribute) and func.attr == "dump":
         if isinstance(func.value, ast.Name) and func.value.id == "json":
@@ -962,24 +998,30 @@ def _call_writes_to_output_handle(
                 return _references_writer_handle(node.args[1], writer_aliases) or _is_output_open_call(
                     node.args[1],
                     references,
+                    path_constructors,
                 )
     if isinstance(func, ast.Name) and func.id == "dump":
         if len(node.args) >= 2:
             return _references_writer_handle(node.args[1], writer_aliases) or _is_output_open_call(
                 node.args[1],
                 references,
+                path_constructors,
             )
     return False
 
 
-def _is_output_open_call(node: ast.AST, references: set[str]) -> bool:
+def _is_output_open_call(
+    node: ast.AST,
+    references: set[str],
+    path_constructors: tuple[set[str], set[str]],
+) -> bool:
     if not isinstance(node, ast.Call) or not _open_call_writes(node):
         return False
     func = node.func
     if isinstance(func, ast.Name) and func.id == "open":
-        return bool(node.args and _references_output_value(node.args[0], references))
+        return bool(node.args and _is_exact_output_path_reference(node.args[0], references, path_constructors))
     if isinstance(func, ast.Attribute) and func.attr == "open":
-        return _references_output_value(func.value, references)
+        return _is_exact_output_path_reference(func.value, references, path_constructors)
     return False
 
 
@@ -1039,7 +1081,11 @@ def _env_value_aliases(tree: ast.AST, env_name: str) -> set[str]:
     return aliases
 
 
-def _path_aliases_from_output(tree: ast.AST, output_aliases: set[str]) -> set[str]:
+def _path_aliases_from_output(
+    tree: ast.AST,
+    output_aliases: set[str],
+    path_constructors: tuple[set[str], set[str]],
+) -> set[str]:
     aliases: set[str] = set()
     references = output_aliases | aliases
     changed = True
@@ -1056,7 +1102,7 @@ def _path_aliases_from_output(tree: ast.AST, output_aliases: set[str]) -> set[st
                 value = node.value
             if value is None:
                 continue
-            if _references_output_value(value, references):
+            if _is_exact_output_path_reference(value, references, path_constructors):
                 before = len(aliases)
                 aliases.update(_assigned_names(targets))
                 references = output_aliases | aliases
@@ -1074,13 +1120,90 @@ def _assigned_names(targets: list[ast.expr]) -> set[str]:
     return names
 
 
-def _references_output_value(node: ast.AST, references: set[str]) -> bool:
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name) and child.id in references:
-            return True
-        if _node_reads_env_name(child, "OUTPUT_FILE"):
-            return True
+def _is_exact_output_path_reference(
+    node: ast.AST,
+    references: set[str],
+    path_constructors: tuple[set[str], set[str]],
+) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in references
+    if _node_reads_env_name(node, "OUTPUT_FILE"):
+        return True
+    if isinstance(node, ast.Call) and _is_path_constructor_call(node, path_constructors):
+        return bool(node.args and _is_exact_output_path_reference(node.args[0], references, path_constructors))
     return False
+
+
+def _is_path_constructor_call(node: ast.Call, path_constructors: tuple[set[str], set[str]]) -> bool:
+    direct_names, module_names = path_constructors
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in direct_names
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "Path"
+        and isinstance(func.value, ast.Name)
+        and func.value.id in module_names
+    )
+
+
+def _path_constructor_refs(tree: ast.AST) -> tuple[set[str], set[str]]:
+    direct_names: set[str] = set()
+    module_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "pathlib":
+                    module_names.add(alias.asname or "pathlib")
+        elif isinstance(node, ast.ImportFrom) and node.module == "pathlib":
+            for alias in node.names:
+                if alias.name == "Path":
+                    direct_names.add(alias.asname or "Path")
+
+    assigned_names = _assigned_name_ids(tree)
+    assigned_paths = _assigned_attribute_paths(tree)
+    direct_names -= assigned_names
+    module_names = {
+        name
+        for name in module_names
+        if name not in assigned_names and f"{name}.Path" not in assigned_paths
+    }
+    return direct_names, module_names
+
+
+def _assigned_name_ids(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for target in _assignment_targets(tree):
+        names.update(_assigned_names([target]))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+    return names
+
+
+def _assigned_attribute_paths(tree: ast.AST) -> set[str]:
+    paths: set[str] = set()
+    for target in _assignment_targets(tree):
+        path = _attribute_path(target)
+        if path:
+            paths.add(path)
+    return paths
+
+
+def _assignment_targets(tree: ast.AST) -> list[ast.expr]:
+    targets: list[ast.expr] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets.extend(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets.append(node.target)
+        elif isinstance(node, ast.AugAssign):
+            targets.append(node.target)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            targets.append(node.target)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            targets.extend(item.optional_vars for item in node.items if item.optional_vars is not None)
+    return targets
 
 
 def _open_call_writes(node: ast.Call) -> bool:

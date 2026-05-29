@@ -155,8 +155,10 @@ workspace/latest/
 ```
 
 `job_search_state.json` is a compact dedupe index only. It stores previous job
-titles, companies, locations, URLs, and dedupe keys so later searches can avoid
-repeating the same postings.
+titles, companies, locations, normalized URLs, dedupe keys, first/last-seen
+timestamps, and compact lifecycle status for closed or uncertain postings so
+later searches can avoid repeating the same active postings without treating
+closed records as current jobs.
 
 Each run also gets a snapshot under:
 

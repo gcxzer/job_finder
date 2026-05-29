@@ -41,13 +41,28 @@ Rules:
   and Closed Or Access-Limited must include a URL when any canonical_url,
   final_url, apply_url, or source_urls value exists anywhere in the provided
   original, verified, match, or company-research inputs.
-- In Good But Unverified and Backlog To Verify Later, include a URL column or URL
-  bullet for each job. Do not write "URL not supplied" unless no URL exists in
-  any input for that job.
+- In Best Verified Targets, use a Markdown table with columns: Role, Company,
+  Verification status, Recommendation, Match score, URL, Notes.
+- Best Verified Targets may include only jobs whose verification_status is
+  verified and whose recommendation is Apply or Maybe. Do not put Skip jobs in
+  Best Verified Targets, even when they are verified and open.
+- In Good But Unverified and Backlog To Verify Later, use a Markdown table with
+  columns: Role, Company, Verification status, Recommendation, URL.
+- In Backlog To Verify Later, list each not_verified_backlog job as its own table
+  row. Do not group multiple jobs into one bullet or summary row.
+- Do not write "URL not supplied" unless no URL exists in any input for that job.
 - For each job URL, prefer apply_url when it is specified, otherwise final_url,
   otherwise canonical_url, otherwise the first source_urls entry.
 - Prefer verified job details over unverified search snippets when both are available.
 - Put jobs into the status section that best matches the verified job results.
+- When summarizing recommendations, derive counts from Match State JSON or the
+  explicit match report. Do not say all recommendations are Maybe, Apply, Skip,
+  or any other value unless every reviewed job has that recommendation.
+- Preserve recommendation labels from the match report exactly. Recommendation
+  cells must contain only Apply, Maybe, Skip, or Unspecified. Put match_score in
+  the separate Match score column, and put caveats in Notes.
+- Do not introduce new recommendation labels such as "Conditional",
+  "Recommended with caveats", or "Strong Maybe"; put caveats in Notes instead.
 - Explain verification status clearly:
   - access_blocked or login_required means the crawler could not read the page; it does not mean the job is closed.
   - closed means the posting appears unavailable and should be skipped.

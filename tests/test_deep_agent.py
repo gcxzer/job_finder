@@ -32,6 +32,15 @@ class MainAgentPromptTests(unittest.TestCase):
         self.assertIn("workspace job dedupe index", deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
         self.assertNotIn("Company State JSON from the output.\n   - Call update_job_search_state", deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
 
+    def test_main_agent_uses_artifact_state_update_tool(self) -> None:
+        self.assertIn("update_job_search_state_from_artifact", deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('file_name="02_raw_job_results.md"', deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('state_section_heading="Job State JSON"', deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('file_name="03_verified_job_results.md"', deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn('state_section_heading="Verified Job State JSON"', deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("retry the state", deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+        self.assertIn("missing or contains invalid JSON", deep_agent.MAIN_AGENT_SYSTEM_PROMPT)
+
 
 if __name__ == "__main__":
     unittest.main()

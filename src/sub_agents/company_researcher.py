@@ -51,11 +51,6 @@ Repeat the same company block format for each researched target.
 ## Assumptions And Gaps
 - Gap:
 
-## Company State JSON
-```json
-{{"companies": [], "jobs": []}}
-```
-
 Rules:
 - Research only the top {CONFIG.search.company_research_top_n} targets from the resume match report.
 - Use the provided search_date/current_date/run_date or intake Search date for the Search date field.
@@ -69,10 +64,6 @@ Rules:
 - Do not invent company facts, team facts, funding, size, tech stack, news, or hiring details.
 - If a field is not available, write "Unspecified".
 - Keep interview preparation practical and tied to the role/company evidence.
-- The Company State JSON must be valid JSON.
-- In Company State JSON, include companies with: name, website, industry, size, locations, research_status, last_researched_at, summary, risks, interview_prep.
-- In Company State JSON, include researched jobs with: title, company, location, canonical_url, company_research_status.
-- Do not include comments or Markdown inside the JSON code block.
 - Do not do resume matching; resume_matcher already handled that.
 - Do not write final application materials or a final report."""
 

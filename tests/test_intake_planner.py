@@ -25,6 +25,10 @@ class IntakePlannerMiddlewareTests(unittest.TestCase):
         self.assertIn("- Search date:", INTAKE_PLANNER_SYSTEM_PROMPT)
         self.assertIn("Preserve any user-provided search_date", INTAKE_PLANNER_SYSTEM_PROMPT)
 
+    def test_intake_planner_defaults_blocking_questions_to_none(self) -> None:
+        self.assertIn("## Blocking Questions\n- None.", INTAKE_PLANNER_SYSTEM_PROMPT)
+        self.assertIn('write exactly "- None."', INTAKE_PLANNER_SYSTEM_PROMPT)
+
     def test_phone_detector_preserves_dates_and_timelines(self) -> None:
         text = "Search date 2026-05-28. Start date 2026-06. Experience from 2021 05 28."
 

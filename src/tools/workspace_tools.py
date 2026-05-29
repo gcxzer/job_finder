@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from langchain_core.tools import tool
 
@@ -27,6 +29,11 @@ RUN_ID_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}(?:_\d+)?\Z")
 
 MAX_STATE_SOURCE_URLS = 8
 MAX_DEDUPE_STATE_JOBS = 60
+DEDUPE_STATUS_RANK = {
+    "active": 0,
+    "unknown": 0,
+    "closed": 1,
+}
 PLACEHOLDER_TEXT_VALUES = {
     "",
     "n/a",
@@ -46,6 +53,25 @@ VERIFICATION_STATUSES_WITH_UNKNOWN_LIFECYCLE = {
     "not_verified_backlog",
     "unverified",
 }
+TRACKING_QUERY_PARAMS = {
+    "fbclid",
+    "gclid",
+    "gh_src",
+    "igshid",
+    "li_fat_id",
+    "mc_cid",
+    "mc_eid",
+    "mkt_tok",
+    "msclkid",
+    "ref",
+    "ref_src",
+    "referrer",
+    "source",
+    "src",
+    "trk",
+    "yclid",
+}
+TRACKING_QUERY_PREFIXES = ("utm_",)
 
 
 @tool
@@ -131,8 +157,62 @@ def update_job_search_state(run_id: str, state_patch_json: str) -> dict[str, Any
 
     if not isinstance(patch, dict):
         return {"success": False, "error": "State patch must be a JSON object."}
-    patch = _compact_state_patch(patch)
+    return _merge_job_search_state_patch(patch)
 
+
+@tool
+def update_job_search_state_from_artifact(
+    run_id: str,
+    file_name: str,
+    state_section_heading: str = "",
+) -> dict[str, Any]:
+    """Extract a state JSON block from a saved artifact and merge it into the job dedupe index."""
+    if file_name not in ARTIFACT_FILES:
+        return {
+            "success": False,
+            "file_name": file_name,
+            "error": f"Unsupported artifact file. Expected one of: {sorted(ARTIFACT_FILES)}",
+        }
+
+    run_dir, error = _existing_run_dir_or_error(run_id)
+    if error is not None:
+        return error
+    assert run_dir is not None
+
+    artifact_path = run_dir / file_name
+    if not artifact_path.exists() or not artifact_path.is_file():
+        return {
+            "success": False,
+            "file_name": file_name,
+            "run_id": run_id,
+            "error": "Artifact file does not exist. Save the artifact before updating state.",
+        }
+
+    content = artifact_path.read_text(encoding="utf-8")
+    try:
+        patch = _loads_jsonish_from_markdown_section(content, state_section_heading)
+    except ValueError as error:
+        return {
+            "success": False,
+            "file_name": file_name,
+            "run_id": run_id,
+            "state_section_heading": state_section_heading,
+            "error": str(error),
+        }
+
+    if not isinstance(patch, dict):
+        return {"success": False, "error": "State patch must be a JSON object."}
+    if not isinstance(patch.get("jobs"), list):
+        return {"success": False, "error": "Extracted state patch must include a jobs list."}
+
+    result = _merge_job_search_state_patch(patch)
+    result["source_file"] = str(artifact_path)
+    result["state_section_heading"] = state_section_heading
+    return result
+
+
+def _merge_job_search_state_patch(patch: dict[str, Any]) -> dict[str, Any]:
+    patch = _compact_state_patch(patch)
     LATEST_DIR.mkdir(parents=True, exist_ok=True)
     state = _read_state()
     now = _now_iso()
@@ -146,6 +226,7 @@ def update_job_search_state(run_id: str, state_patch_json: str) -> dict[str, Any
         "success": True,
         "file_path": str(LATEST_DIR / "job_search_state.json"),
         "job_count": len(state["jobs"]),
+        "merged_job_count": len(patch.get("jobs", [])) if isinstance(patch.get("jobs"), list) else 0,
     }
 
 
@@ -158,7 +239,7 @@ def read_job_search_dedupe_state(limit: int = MAX_DEDUPE_STATE_JOBS) -> dict[str
         jobs = []
 
     clean_limit = max(0, min(int(limit or 0), MAX_DEDUPE_STATE_JOBS))
-    selected_jobs = [job for job in jobs if isinstance(job, dict)][-clean_limit:] if clean_limit else []
+    selected_jobs = _select_dedupe_jobs(jobs, clean_limit)
     return {
         "success": True,
         "file_path": str(LATEST_DIR / "job_search_state.json"),
@@ -327,6 +408,29 @@ def _loads_jsonish(value: str) -> Any:
     raise ValueError("Input must be valid JSON or contain a JSON fenced block.")
 
 
+def _loads_jsonish_from_markdown_section(markdown: str, heading: str = "") -> Any:
+    clean_heading = str(heading or "").strip().lstrip("#").strip()
+    if not clean_heading:
+        return _loads_jsonish(markdown)
+
+    heading_pattern = re.compile(
+        rf"^#{{1,6}}\s+{re.escape(clean_heading)}\s*$",
+        flags=re.MULTILINE,
+    )
+    match = heading_pattern.search(markdown)
+    if match is None:
+        raise ValueError(f'Markdown section heading "{clean_heading}" was not found.')
+
+    section_start = match.end()
+    next_heading = re.search(r"^#{1,6}\s+", markdown[section_start:], flags=re.MULTILINE)
+    section = (
+        markdown[section_start : section_start + next_heading.start()]
+        if next_heading is not None
+        else markdown[section_start:]
+    )
+    return _loads_jsonish(section)
+
+
 def _merge_dict(base: Any, patch: dict[str, Any]) -> dict[str, Any]:
     result = dict(base) if isinstance(base, dict) else {}
     for key, value in patch.items():
@@ -357,6 +461,8 @@ def _compact_job_for_state(job: dict[str, Any]) -> dict[str, Any]:
         "source_urls": job.get("source_urls"),
         "dedupe_key": job.get("dedupe_key") or job.get("duplicate_key"),
         "duplicate_key": job.get("duplicate_key") or job.get("dedupe_key"),
+        "verification_status": job.get("verification_status"),
+        "status": job.get("status"),
     }
     next_job["source_urls"] = _compact_string_list(next_job.get("source_urls"), limit=MAX_STATE_SOURCE_URLS, max_chars=500)
     return next_job
@@ -442,7 +548,7 @@ def _existing_job_key(
     if job_id in merged:
         return job_id
     duplicate_key = str(job.get("duplicate_key") or job.get("dedupe_key") or "").strip()
-    if duplicate_key:
+    if _has_strong_dedupe_key(duplicate_key):
         for candidate_key, candidate in merged.items():
             if str(candidate.get("duplicate_key") or candidate.get("dedupe_key") or "").strip() == duplicate_key:
                 return candidate_key
@@ -451,9 +557,10 @@ def _existing_job_key(
 
 def _merge_job(existing: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     first_seen = existing.get("first_seen_at") or job.get("first_seen_at") or _today()
-    source_urls = _merge_unique(existing.get("source_urls", []), job.get("source_urls", []))
+    canonical_url_changed = _canonical_url_changed(existing, job)
+    source_urls = _merge_unique_urls(existing.get("source_urls", []), job.get("source_urls", []))
     if job.get("canonical_url"):
-        source_urls = _merge_unique(source_urls, [job["canonical_url"]])
+        source_urls = _merge_unique_urls(source_urls, [job["canonical_url"]])
 
     next_job = _merge_job_fields(existing, job)
     next_job["job_id"] = existing.get("job_id") or job["job_id"]
@@ -462,10 +569,12 @@ def _merge_job(existing: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     next_job["source_urls"] = source_urls
     explicit_status = _status_from_explicit_verification(job)
     if explicit_status is not None:
-        if explicit_status == "unknown" and existing.get("status") == "closed":
+        if explicit_status == "unknown" and existing.get("status") == "closed" and not canonical_url_changed:
             next_job["status"] = "closed"
         else:
             next_job["status"] = explicit_status
+    elif _should_reactivate_closed_status(existing, job, canonical_url_changed):
+        next_job["status"] = "active"
     else:
         next_job.setdefault("status", "active")
     return next_job
@@ -473,15 +582,25 @@ def _merge_job(existing: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
 
 def _job_dedupe_record(job: dict[str, Any]) -> dict[str, Any]:
     source_urls = _compact_string_list(job.get("source_urls"), limit=MAX_STATE_SOURCE_URLS, max_chars=500)
+    status = str(job.get("status") or "").strip().lower()
+    dedupe_key = str(job.get("dedupe_key") or job.get("duplicate_key") or "").strip()
     record = {
         "title": str(job.get("title") or "").strip(),
         "company": str(job.get("company") or "").strip(),
         "location": str(job.get("location") or "").strip(),
         "canonical_url": str(job.get("canonical_url") or "").strip(),
         "source_urls": source_urls,
-        "dedupe_key": str(job.get("dedupe_key") or job.get("duplicate_key") or "").strip(),
+        "dedupe_key": dedupe_key if _has_strong_dedupe_key(dedupe_key) else "",
+        "first_seen_at": str(job.get("first_seen_at") or "").strip(),
+        "last_seen_at": str(job.get("last_seen_at") or "").strip(),
     }
-    return {key: value for key, value in record.items() if _has_meaningful_value(value)}
+    if status and status != "active":
+        record["status"] = status
+    return {
+        key: value
+        for key, value in record.items()
+        if (key == "status" and value in {"closed", "unknown"}) or _has_meaningful_value(value)
+    }
 
 
 def _merge_job_fields(existing: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
@@ -499,6 +618,26 @@ def _should_keep_existing_job_value(key: str, existing_value: Any, incoming_valu
     if key == "status" and incoming_value == "active" and existing_value != "active":
         return True
     return not _has_meaningful_value(incoming_value)
+
+
+def _canonical_url_changed(existing: dict[str, Any], job: dict[str, Any]) -> bool:
+    incoming_url = _canonical_url_key(job.get("canonical_url"))
+    if not incoming_url:
+        return False
+    existing_url = _canonical_url_key(existing.get("canonical_url"))
+    return incoming_url != existing_url
+
+
+def _should_reactivate_closed_status(
+    existing: dict[str, Any],
+    job: dict[str, Any],
+    canonical_url_changed: bool,
+) -> bool:
+    return (
+        str(existing.get("status") or "").strip().lower() == "closed"
+        and str(job.get("status") or "").strip().lower() == "active"
+        and canonical_url_changed
+    )
 
 
 def _merge_companies(existing_companies: list[Any], incoming_companies: list[Any], now: str) -> list[dict[str, Any]]:
@@ -545,14 +684,14 @@ def _normalize_job(job: dict[str, Any], now: str) -> dict[str, Any]:
     next_job.setdefault("location", "")
     next_job.setdefault("canonical_url", "")
     next_job.setdefault("source_urls", [])
-    next_job["normalized_company"] = next_job.get("normalized_company") or _slug(next_job["company"])
-    next_job["normalized_title"] = next_job.get("normalized_title") or _slug(next_job["title"])
-    next_job["normalized_location"] = next_job.get("normalized_location") or _slug(next_job["location"])
-    dedupe_key = (
-        next_job.get("dedupe_key")
-        or next_job.get("duplicate_key")
-        or f"{next_job['normalized_company']}|{next_job['normalized_title']}|{next_job['normalized_location']}"
-    )
+    next_job["canonical_url"] = _normalize_canonical_url(next_job.get("canonical_url"))
+    next_job["source_urls"] = _normalize_url_list(next_job.get("source_urls"))
+    next_job["normalized_company"] = _slug(next_job.get("normalized_company") or next_job["company"])
+    next_job["normalized_title"] = _slug(next_job.get("normalized_title") or next_job["title"])
+    next_job["normalized_location"] = _slug(next_job.get("normalized_location") or next_job["location"])
+    field_dedupe_key = _dedupe_key_from_fields(next_job)
+    input_dedupe_key = _normalize_dedupe_key(next_job.get("dedupe_key") or next_job.get("duplicate_key"))
+    dedupe_key = field_dedupe_key if _has_strong_dedupe_key(field_dedupe_key) else input_dedupe_key or field_dedupe_key
     next_job["dedupe_key"] = dedupe_key
     next_job["duplicate_key"] = dedupe_key
     next_job["job_id"] = next_job.get("job_id") or _job_id(next_job)
@@ -609,17 +748,114 @@ def _job_id(job: dict[str, Any]) -> str:
 
 
 def _canonical_url_key(value: Any) -> str:
-    return str(value or "").strip().rstrip("/")
+    return _normalize_canonical_url(value)
 
 
 def _slug(value: Any) -> str:
-    text = str(value or "").lower().strip()
+    if _is_placeholder_text(value):
+        return ""
+    text = unicodedata.normalize("NFKD", str(value or "").lower().strip())
+    text = "".join(character for character in text if not unicodedata.combining(character))
     text = re.sub(r"[^a-z0-9]+", "_", text)
     return re.sub(r"_+", "_", text).strip("_")
 
 
-def _merge_unique(first: Any, second: Any) -> list[str]:
+def _dedupe_key_from_fields(job: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            _slug(job.get("company")),
+            _slug(job.get("title")),
+            _slug(job.get("location")),
+        ]
+    )
+
+
+def _normalize_dedupe_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or _is_placeholder_text(text):
+        return ""
+    if "|" in text:
+        return "|".join(_slug(part) for part in text.split("|"))
+    return _slug(text)
+
+
+def _has_strong_dedupe_key(value: str) -> bool:
+    parts = value.split("|")
+    return len(parts) == 3 and all(bool(part.strip()) for part in parts)
+
+
+def _normalize_canonical_url(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or _is_placeholder_text(text):
+        return ""
+
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return text.rstrip("/")
+
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return text.rstrip("/")
+
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").strip("[]").rstrip(".").lower()
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+
+    port = _url_port(parsed)
+    default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    netloc = host if port is None or default_port else f"{host}:{port}"
+
+    path = parsed.path or ""
+    if path and path != "/":
+        path = re.sub(r"/{2,}", "/", path).rstrip("/")
+    else:
+        path = ""
+
+    query_items = []
+    for key, query_value in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized_key = key.lower()
+        if normalized_key in TRACKING_QUERY_PARAMS:
+            continue
+        if any(normalized_key.startswith(prefix) for prefix in TRACKING_QUERY_PREFIXES):
+            continue
+        query_items.append((key, query_value))
+    query_items.sort(key=lambda item: (item[0].lower(), item[1]))
+    query = urlencode(query_items, doseq=True)
+
+    return urlunsplit((scheme, netloc, path, query, ""))
+
+
+def _url_port(parsed: Any) -> int | None:
+    try:
+        return parsed.port
+    except ValueError:
+        return None
+
+
+def _normalize_url_list(value: Any) -> list[str]:
     values: list[str] = []
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = []
+    for item in items:
+        normalized = _normalize_canonical_url(item)
+        key = _canonical_url_key(normalized)
+        if normalized and key and key not in {_canonical_url_key(existing) for existing in values}:
+            values.append(normalized)
+    return values
+
+
+def _merge_unique_urls(first: Any, second: Any) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
     for source in (first, second):
         if isinstance(source, str):
             items = [source]
@@ -628,9 +864,11 @@ def _merge_unique(first: Any, second: Any) -> list[str]:
         else:
             items = []
         for item in items:
-            text = str(item).strip()
-            if text and text not in values:
+            text = _normalize_canonical_url(item)
+            key = _canonical_url_key(text)
+            if text and key and key not in seen:
                 values.append(text)
+                seen.add(key)
     return values
 
 
@@ -646,6 +884,49 @@ def _has_meaningful_value(value: Any) -> bool:
     return True
 
 
+def _select_dedupe_jobs(jobs: list[Any], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    indexed_jobs = [(index, job) for index, job in enumerate(jobs) if isinstance(job, dict)]
+    selected = sorted(indexed_jobs, key=_dedupe_selection_key)[:limit]
+    return [job for _index, job in selected]
+
+
+def _dedupe_selection_key(indexed_job: tuple[int, dict[str, Any]]) -> tuple[int, float, int]:
+    index, job = indexed_job
+    status = _dedupe_status(job)
+    return (
+        DEDUPE_STATUS_RANK.get(status, DEDUPE_STATUS_RANK["active"]),
+        -_dedupe_seen_timestamp(job),
+        -index,
+    )
+
+
+def _dedupe_status(job: dict[str, Any]) -> str:
+    status = str(job.get("status") or "").strip().lower()
+    return status if status in DEDUPE_STATUS_RANK else "active"
+
+
+def _dedupe_seen_timestamp(job: dict[str, Any]) -> float:
+    for key in ("last_seen_at", "updated_at", "first_seen_at"):
+        timestamp = _parse_datetime_timestamp(job.get(key))
+        if timestamp:
+            return timestamp
+    return 0.0
+
+
+def _parse_datetime_timestamp(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def _dedupe_brief(jobs: list[dict[str, Any]]) -> str:
     if not jobs:
         return "No previous job dedupe records."
@@ -656,7 +937,11 @@ def _dedupe_brief(jobs: list[dict[str, Any]]) -> str:
         location = job.get("location") or "Unknown location"
         dedupe_key = job.get("dedupe_key") or ""
         canonical_url = job.get("canonical_url") or ""
-        lines.append(f"- {company} | {title} | {location} | dedupe_key={dedupe_key} | url={canonical_url}")
+        status = job.get("status") or "active_or_previous"
+        last_seen = job.get("last_seen_at") or "unknown"
+        lines.append(
+            f"- {company} | {title} | {location} | status={status} | last_seen={last_seen} | dedupe_key={dedupe_key} | url={canonical_url}"
+        )
     return "\n".join(lines)
 
 
@@ -666,4 +951,5 @@ WORKSPACE_TOOLS = [
     save_job_artifact,
     read_job_search_dedupe_state,
     update_job_search_state,
+    update_job_search_state_from_artifact,
 ]

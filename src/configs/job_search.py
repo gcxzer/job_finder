@@ -1,8 +1,8 @@
 job_search = {
     "resume_pdf_path": "",
     "target_roles": [""],
-    "target_locations": ["München"],
-    "candidate_skills": ["python", "AI"],
+    "target_locations": [],
+    "candidate_skills": [],
     "remote_preference": "",
     "industries": [],
     "company_preferences": [],

@@ -279,7 +279,10 @@ class GeneratedCrawlerToolsTests(unittest.TestCase):
             self.assertIn("PYTHONPATH=", command["run_command"])
             self.assertNotIn("fake-useragent", command["setup_command"])
             self.assertIn("missing =", command["setup_command"])
-            self.assertIn("beautifulsoup4", command["setup_command"])
+            self.assertIn("timeout 120s python", command["setup_command"])
+            self.assertIn("beautifulsoup4==4.14.3", command["setup_command"])
+            self.assertIn("requests==2.34.2", command["setup_command"])
+            self.assertIn("PIP_DEFAULT_TIMEOUT", command["setup_command"])
 
     def test_build_crawler_command_rejects_private_target_url(self) -> None:
         with tempfile.TemporaryDirectory(dir=CONFIG.workspace.root_dir) as temp_dir:
@@ -340,6 +343,26 @@ class GeneratedCrawlerToolsTests(unittest.TestCase):
             validation = crawler_tools.validate_job_crawler_code.invoke({"code_file": str(code_path)})
 
             self.assertTrue(validation["success"], validation)
+
+    def test_validate_rejects_writes_to_paths_derived_from_output_file(self) -> None:
+        with tempfile.TemporaryDirectory(dir=CONFIG.workspace.root_dir) as temp_dir:
+            code_path = Path(temp_dir) / "crawler.py"
+            code_path.write_text(_invalid_output_sibling_write_crawler_code(), encoding="utf-8")
+
+            validation = crawler_tools.validate_job_crawler_code.invoke({"code_file": str(code_path)})
+
+        self.assertFalse(validation["success"])
+        self.assertTrue(any("Must write only to OUTPUT_FILE" in error for error in validation["contract_errors"]))
+
+    def test_validate_rejects_shadowed_path_constructor_for_output_write(self) -> None:
+        with tempfile.TemporaryDirectory(dir=CONFIG.workspace.root_dir) as temp_dir:
+            code_path = Path(temp_dir) / "crawler.py"
+            code_path.write_text(_invalid_shadowed_path_constructor_crawler_code(), encoding="utf-8")
+
+            validation = crawler_tools.validate_job_crawler_code.invoke({"code_file": str(code_path)})
+
+        self.assertFalse(validation["success"])
+        self.assertTrue(any("Must write only to OUTPUT_FILE" in error for error in validation["contract_errors"]))
 
     def test_validate_rejects_open_without_output_write(self) -> None:
         with tempfile.TemporaryDirectory(dir=CONFIG.workspace.root_dir) as temp_dir:
@@ -613,6 +636,77 @@ result = {
 
 with open(output_file, mode="w", encoding="utf-8") as handle:
     json.dump(result, handle)
+'''
+
+
+def _invalid_output_sibling_write_crawler_code() -> str:
+    return '''
+import json
+import os
+import requests
+from pathlib import Path
+
+from bs4 import BeautifulSoup
+
+target_url = os.environ["TARGET_URL"]
+output_file = os.environ["OUTPUT_FILE"]
+session = requests.Session()
+soup = BeautifulSoup("", "lxml")
+
+result = {
+    "success": True,
+    "schema_version": "job_extraction_context_v1",
+    "url": target_url,
+    "final_url": target_url,
+    "extraction_method": "crawler",
+    "technical_status": "readable",
+    "verification_status": "unverified",
+    "standard_extraction": {},
+    "page_context": {},
+    "technical_signals": {},
+    "verified_at": "",
+    "error": None,
+}
+
+side_effect_file = Path(output_file).with_name("side_effect.txt")
+side_effect_file.write_text("unexpected write", encoding="utf-8")
+Path(output_file).write_text(json.dumps(result), encoding="utf-8")
+'''
+
+
+def _invalid_shadowed_path_constructor_crawler_code() -> str:
+    return '''
+import json
+import os
+import requests
+from pathlib import Path as RealPath
+
+from bs4 import BeautifulSoup
+
+target_url = os.environ["TARGET_URL"]
+output_file = os.environ["OUTPUT_FILE"]
+session = requests.Session()
+soup = BeautifulSoup("", "lxml")
+
+def Path(value):
+    return RealPath(value).with_name("side_effect.txt")
+
+result = {
+    "success": True,
+    "schema_version": "job_extraction_context_v1",
+    "url": target_url,
+    "final_url": target_url,
+    "extraction_method": "crawler",
+    "technical_status": "readable",
+    "verification_status": "unverified",
+    "standard_extraction": {},
+    "page_context": {},
+    "technical_signals": {},
+    "verified_at": "",
+    "error": None,
+}
+
+Path(output_file).write_text(json.dumps(result), encoding="utf-8")
 '''
 
 

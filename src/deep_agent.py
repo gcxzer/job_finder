@@ -46,8 +46,12 @@ Run the full pipeline in this order:
    - Include the dedupe_brief from read_job_search_dedupe_state.
    - Ask job_searcher to follow its own system prompt.
    - Save the result as 02_raw_job_results.md with save_job_artifact.
-   - Extract the Job State JSON from the output.
-   - Call update_job_search_state with that JSON.
+   - Call update_job_search_state_from_artifact with run_id,
+     file_name="02_raw_job_results.md", and state_section_heading="Job State JSON".
+   - If the state update tool returns success=false because the section is
+     missing or contains invalid JSON, ask job_searcher to rewrite the artifact
+     with a valid Job State JSON section, save it again, and retry the state
+     update once before continuing.
 
 4. Job verification
    - Send the run_id, intake brief, and 02_raw_job_results.md content to job_verifier.
@@ -55,8 +59,13 @@ Run the full pipeline in this order:
    - If job_verifier generates crawler code, it should save it under the same run_id.
    - Generated crawler execution should use the built-in execute tool, which runs in DockerBackend.
    - Save the result as 03_verified_job_results.md with save_job_artifact.
-   - Extract the Verified Job State JSON from the output.
-   - Call update_job_search_state with that JSON.
+   - Call update_job_search_state_from_artifact with run_id,
+     file_name="03_verified_job_results.md", and
+     state_section_heading="Verified Job State JSON".
+   - If the state update tool returns success=false because the section is
+     missing or contains invalid JSON, ask job_verifier to rewrite the artifact
+     with a valid Verified Job State JSON section, save it again, and retry the
+     state update once before continuing.
 
 5. Resume matching
    - Send the intake brief and verified job results to resume_matcher.
