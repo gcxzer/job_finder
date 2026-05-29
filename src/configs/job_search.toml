@@ -1,7 +1,7 @@
 [job_search]
 resume_pdf_path = ""
-target_roles = ["Backend Engineer"]
-target_locations = ["Leipzig"]
+target_roles = [""]
+target_locations = [""]
 remote_preference = ""
 industries = []
 company_preferences = []
