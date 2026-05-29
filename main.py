@@ -1,12 +1,6 @@
-'''
-@Description: 
-@Version: 
-@Author: Xuan Zhu
-@Date: 
-LastEditTime: 2026-05-27 21:09:09
-'''
-def main():
-    print("Hello from job-finder!")
+from __future__ import annotations
+
+from src.task_runner import main
 
 
 if __name__ == "__main__":

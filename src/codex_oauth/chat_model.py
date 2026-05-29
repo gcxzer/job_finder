@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from copy import deepcopy
 from typing import Any, Iterator, Sequence
 
 import httpx
+from langchain_core.language_models.base import LangSmithParams
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -13,7 +16,7 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import Field, PrivateAttr
 
-from codex_oauth.auth import (
+from src.codex_oauth.auth import (
     DEFAULT_CODEX_BASE_URL,
     CodexAuthError,
     CodexAuthStore,
@@ -32,7 +35,8 @@ class CodexOAuthChatModel(BaseChatModel):
     model_name: str = Field(default="gpt-5.5")
     auth_store_path: str | None = None
     base_url: str = DEFAULT_CODEX_BASE_URL
-    timeout: float = 120.0
+    timeout: float | httpx.Timeout = 300.0
+    max_retries: int = 2
     request_options: dict[str, Any] = Field(default_factory=dict)
 
     _auth_store: CodexAuthStore = PrivateAttr()
@@ -51,6 +55,20 @@ class CodexOAuthChatModel(BaseChatModel):
             "base_url": self.base_url,
             "auth_store_path": self.auth_store_path,
         }
+
+    def _get_ls_params(
+        self,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> LangSmithParams:
+        params = LangSmithParams(
+            ls_provider="codex_oauth",
+            ls_model_type="chat",
+            ls_model_name=str(kwargs.get("model") or self.model_name),
+        )
+        if stop:
+            params["ls_stop"] = stop
+        return params
 
     def bind_tools(
         self,
@@ -112,6 +130,29 @@ class CodexOAuthChatModel(BaseChatModel):
         return _strip_none(payload)
 
     def _create_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        retryable_errors = (
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.RemoteProtocolError,
+            httpx.TimeoutException,
+        )
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self._create_response_once(payload)
+            except retryable_errors as error:
+                if attempt >= self.max_retries:
+                    raise CodexAuthError(
+                        f"Codex response request failed after {self.max_retries + 1} attempts: {error}",
+                        code="codex_response_transport_error",
+                    ) from error
+                time.sleep(min(2**attempt, 5))
+
+        raise CodexAuthError(
+            "Codex response request failed before receiving a response.",
+            code="codex_response_transport_error",
+        )
+
+    def _create_response_once(self, payload: dict[str, Any]) -> dict[str, Any]:
         credentials = self._auth_store.runtime_credentials()
         if not credentials.access_token:
             raise CodexAuthError(
@@ -136,7 +177,9 @@ class CodexOAuthChatModel(BaseChatModel):
                         f"Codex response request failed with status {response.status_code}: {detail[:500]}",
                         code="codex_response_error",
                     ) from error
-                return _collect_stream_response(response.iter_lines())
+                result = _collect_stream_response(response.iter_lines())
+                _raise_for_response_error(result)
+                return result
 
 
 def _messages_to_responses_input(messages: list[BaseMessage]) -> tuple[str | None, list[dict[str, Any]]]:
@@ -163,6 +206,11 @@ def _messages_to_responses_input(messages: list[BaseMessage]) -> tuple[str | Non
             continue
 
         if isinstance(message, AIMessage):
+            raw_output_items = _response_output_items_from_message(message)
+            if raw_output_items:
+                input_items.extend(raw_output_items)
+                continue
+
             text = _content_text(message.content)
             if text and not message.tool_calls:
                 input_items.append(
@@ -208,6 +256,9 @@ def _responses_tools(tools: Sequence[Any]) -> list[dict[str, Any]]:
     for tool in tools:
         if not isinstance(tool, dict):
             continue
+        if tool.get("type") in _BUILT_IN_RESPONSE_TOOLS:
+            converted.append(dict(tool))
+            continue
         if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
             function = tool["function"]
             name = function.get("name")
@@ -228,6 +279,14 @@ def _responses_tools(tools: Sequence[Any]) -> list[dict[str, Any]]:
             next_tool.setdefault("parameters", {"type": "object", "properties": {}})
             converted.append(next_tool)
     return converted
+
+
+_BUILT_IN_RESPONSE_TOOLS = {
+    "web_search",
+    "web_search_2025_08_26",
+    "web_search_preview",
+    "web_search_preview_2025_03_11",
+}
 
 
 def _collect_stream_response(lines: Iterator[str]) -> dict[str, Any]:
@@ -255,7 +314,8 @@ def _collect_stream_response(lines: Iterator[str]) -> dict[str, Any]:
         terminal_response = _apply_stream_event(event, output_items, terminal_response)
 
     response = terminal_response or {"status": "completed", "output": output_items}
-    if output_items and not isinstance(response.get("output"), list):
+    response_output = response.get("output")
+    if output_items and (not isinstance(response_output, list) or not response_output):
         response = {**response, "output": output_items}
     return response
 
@@ -286,11 +346,35 @@ def _apply_stream_event(
         item = event.get("item")
         if isinstance(item, dict):
             output_items.append(item)
-    elif event_type in {"response.completed", "response.incomplete", "response.failed"}:
+    elif event_type in {"response.completed", "response.incomplete", "response.failed", "response.cancelled"}:
         response = event.get("response")
         if isinstance(response, dict):
             terminal_response = response
     return terminal_response
+
+
+def _raise_for_response_error(response: dict[str, Any]) -> None:
+    status = str(response.get("status") or "").lower()
+    if status not in {"failed", "cancelled"}:
+        return
+    detail = _response_error_detail(response)
+    raise CodexAuthError(
+        f"Codex response {status}: {detail}",
+        code=f"codex_response_{status}",
+    )
+
+
+def _response_error_detail(response: dict[str, Any]) -> str:
+    error = response.get("error")
+    if isinstance(error, dict):
+        message = _content_text(error.get("message") or error.get("code") or error.get("type"))
+        if message:
+            return message[:500]
+        return json.dumps(error, ensure_ascii=False, sort_keys=True)[:500]
+    if error:
+        return _content_text(error)[:500]
+    response_id = _content_text(response.get("id"))
+    return f"response_id={response_id or 'unknown'}"
 
 
 def _response_to_ai_message(response: dict[str, Any]) -> AIMessage:
@@ -321,6 +405,7 @@ def _response_to_ai_message(response: dict[str, Any]) -> AIMessage:
 
     return AIMessage(
         content="\n".join(part for part in content_parts if part).strip(),
+        additional_kwargs={"response_output_items": deepcopy(response.get("output") or [])},
         tool_calls=tool_calls,
         response_metadata={
             "id": response.get("id"),
@@ -330,6 +415,17 @@ def _response_to_ai_message(response: dict[str, Any]) -> AIMessage:
         },
         usage_metadata=usage_metadata,
     )
+
+
+def _response_output_items_from_message(message: AIMessage) -> list[dict[str, Any]]:
+    output_items = message.additional_kwargs.get("response_output_items")
+    if not isinstance(output_items, list):
+        return []
+    return [deepcopy(item) for item in output_items if _is_response_output_item(item)]
+
+
+def _is_response_output_item(item: Any) -> bool:
+    return isinstance(item, dict) and isinstance(item.get("type"), str)
 
 
 def _message_output_text(item: dict[str, Any]) -> list[str]:

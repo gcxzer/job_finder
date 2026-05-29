@@ -4,7 +4,7 @@
     "./"
   ],
   "graphs": {
-    "agent": "./src/agent.py:agent"
+    "agent": "./src/deep_agent.py:agent"
   },
   "env": ".env"
 }

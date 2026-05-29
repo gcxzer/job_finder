@@ -1,6 +1,6 @@
 """Codex OAuth support for LangChain/DeepAgents models."""
 
-from codex_oauth.auth import (
+from src.codex_oauth.auth import (
     DEFAULT_CODEX_AUTH_PATH,
     DEFAULT_CODEX_BASE_URL,
     CodexAuthError,
@@ -9,8 +9,8 @@ from codex_oauth.auth import (
     codex_default_headers,
     default_codex_auth_path,
 )
-from codex_oauth.chat_model import CodexOAuthChatModel
-from codex_oauth.types import CodexCredentials
+from src.codex_oauth.chat_model import CodexOAuthChatModel
+from src.codex_oauth.types import CodexCredentials
 
 __all__ = [
     "DEFAULT_CODEX_AUTH_PATH",

@@ -13,10 +13,19 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from codex_oauth.types import CodexCredentials
+from src.codex_oauth.types import CodexCredentials
 
 
-DEFAULT_CODEX_AUTH_PATH = Path.cwd() / ".codex_oauth" / "auth" / "codex.json"
+def _project_root_from_source() -> Path:
+    source_path = Path(__file__).resolve()
+    for parent in source_path.parents:
+        if (parent / "pyproject.toml").exists():
+            return parent
+    return source_path.parents[2]
+
+
+PROJECT_ROOT = _project_root_from_source()
+DEFAULT_CODEX_AUTH_PATH = PROJECT_ROOT / ".codex_oauth" / "auth" / "codex.json"
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_ISSUER = "https://auth.openai.com"
@@ -145,7 +154,9 @@ class CodexAuthStore:
         credentials = self.read_credentials()
         if not credentials.configured:
             return credentials
-        if refresh_if_expiring and _access_token_is_expiring(credentials.access_token):
+        if refresh_if_expiring and (
+            not credentials.access_token or _access_token_is_expiring(credentials.access_token)
+        ):
             credentials = refresh_codex_credentials(credentials)
             self.write_credentials(credentials)
         return credentials
@@ -254,8 +265,14 @@ def codex_default_headers(access_token: str) -> dict[str, str]:
 
 
 def default_codex_auth_path() -> Path:
-    override = os.environ.get("CODEX_OAUTH_AUTH_PATH", "").strip()
-    return Path(override).expanduser() if override else DEFAULT_CODEX_AUTH_PATH
+    override = (
+        os.environ.get("JOB_FINDER_CODEX_AUTH_PATH", "").strip()
+        or os.environ.get("CODEX_OAUTH_AUTH_PATH", "").strip()
+    )
+    if not override:
+        return DEFAULT_CODEX_AUTH_PATH
+    path = Path(override).expanduser()
+    return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
 
 
 def _secure_dir(path: Path) -> None:
