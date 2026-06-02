@@ -208,10 +208,10 @@ previous search is still active.
 Schedule with enough room for each run to finish; a typical search takes about
 one hour.
 
-Example crontab entry for weekdays at 09:00:
+Example crontab entry for daily runs at 14:00 on macOS with Docker Desktop:
 
 ```cron
-0 9 * * 1-5 cd /path/to/job_finder && mkdir -p runs/logs && /opt/homebrew/bin/uv run job-finder-run >> runs/logs/cron.log 2>&1
+0 14 * * * cd /path/to/job_finder && mkdir -p runs/logs && PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin DOCKER_HOST=unix://$HOME/.docker/run/docker.sock DOCKER_CONFIG=$HOME/.docker /opt/homebrew/bin/uv run job-finder-run >> runs/logs/cron.log 2>&1
 ```
 
 If `uv` is installed somewhere else, replace `/opt/homebrew/bin/uv` with the
@@ -224,7 +224,7 @@ command -v uv
 To use a custom profile:
 
 ```cron
-0 9 * * 1-5 cd /path/to/job_finder && mkdir -p runs/logs && /opt/homebrew/bin/uv run job-finder-run --task-config src/configs/job_search.py >> runs/logs/cron.log 2>&1
+0 14 * * * cd /path/to/job_finder && mkdir -p runs/logs && PATH=/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin DOCKER_HOST=unix://$HOME/.docker/run/docker.sock DOCKER_CONFIG=$HOME/.docker /opt/homebrew/bin/uv run job-finder-run --task-config src/configs/job_search.py >> runs/logs/cron.log 2>&1
 ```
 
 ## Development
