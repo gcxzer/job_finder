@@ -17,6 +17,7 @@ from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
 from src.configs import CONFIG, PROJECT_ROOT
 from src.logging_utils import setup_logger
+from src.preflight import PreflightError, run_preflight_checks
 from src.sub_agents.intake_planner import detect_phone_numbers
 
 TASK_CONFIG_ENV_VAR = "JOB_FINDER_TASK_CONFIG"
@@ -45,15 +46,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     except (FileNotFoundError, ValueError, SyntaxError) as exc:
         raise SystemExit(f"Failed to load job search task config: {exc}") from exc
 
-    if args.no_lock:
-        asyncio.run(_run_task(task))
-        return
-
     try:
+        if args.no_lock:
+            _run_task_with_preflight(task)
+            return
+
         with run_lock(args.lock_file):
-            asyncio.run(_run_task(task))
+            _run_task_with_preflight(task)
     except LockAlreadyHeld as exc:
         logger.warning("Skipped scheduled run: %s", exc)
+    except PreflightError as exc:
+        logger.error("Preflight checks failed: %s", exc)
+        raise SystemExit(2) from exc
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -78,6 +82,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run without the overlap-prevention lock.",
     )
     return parser.parse_args(argv)
+
+
+def _run_task_with_preflight(task: str) -> None:
+    result = run_preflight_checks()
+    for message in result.messages:
+        logger.info("Preflight check passed: %s", message)
+    asyncio.run(_run_task(task))
 
 
 def load_job_search_task(config_path: str | Path | None = None) -> str:
